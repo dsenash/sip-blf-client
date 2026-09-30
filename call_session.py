@@ -41,6 +41,39 @@ def get_local_ip(target_host):
         s.close()
 
 
+def parse_sip_uri(uri):
+    """Parse a SIP URI like sip:101@192.168.0.89:5060;transport=udp."""
+    uri = uri.strip()
+    if uri.startswith("sip:"):
+        uri = uri[4:]
+
+    transport = None
+    if ";transport=" in uri:
+        uri, params = uri.split(";", 1)
+        for param in params.split(";"):
+            if param.startswith("transport="):
+                transport = param.split("=")[1].lower()
+
+    if "@" in uri:
+        user, hostport = uri.split("@", 1)
+    else:
+        # A host-only URI such as sip:192.168.0.89 puts the whole thing in
+        # hostport; treating it as the user produced sip:192.168.0.89@:5060.
+        user, hostport = "", uri
+
+    if ":" in hostport:
+        host, port = hostport.rsplit(":", 1)
+        try:
+            port = int(port)
+        except ValueError:
+            port = 5060
+    else:
+        host = hostport
+        port = 5060
+
+    return {"user": user, "host": host, "port": port, "transport": transport}
+
+
 class CallSession:
     """A single outbound call, driven one event at a time by the main loop."""
 

@@ -1,6 +1,44 @@
 import unittest
 
-from call_session import CallSession, extract_tag
+from call_session import CallSession, extract_tag, parse_sip_uri
+
+
+class ParseSipUriTest(unittest.TestCase):
+    def test_parses_user_host_and_port(self):
+        self.assertEqual(parse_sip_uri("sip:101@192.168.0.89:5060"),
+                         {"user": "101", "host": "192.168.0.89",
+                          "port": 5060, "transport": None})
+
+    def test_defaults_the_port(self):
+        parsed = parse_sip_uri("sip:101@192.168.0.89")
+        self.assertEqual(parsed["port"], 5060)
+        self.assertEqual(parsed["host"], "192.168.0.89")
+
+    def test_reads_the_transport(self):
+        parsed = parse_sip_uri("sip:101@192.168.0.89:5060;transport=tcp")
+        self.assertEqual(parsed["transport"], "tcp")
+
+    def test_lowercases_the_transport(self):
+        parsed = parse_sip_uri("sip:101@h:5060;transport=TCP")
+        self.assertEqual(parsed["transport"], "tcp")
+
+    def test_strips_the_scheme(self):
+        parsed = parse_sip_uri("101@192.168.0.89:5060")
+        self.assertEqual(parsed["user"], "101")
+
+    def test_trims_surrounding_whitespace(self):
+        parsed = parse_sip_uri("  sip:101@192.168.0.89:5060  ")
+        self.assertEqual(parsed["user"], "101")
+
+    def test_falls_back_to_5060_for_a_non_numeric_port(self):
+        parsed = parse_sip_uri("sip:101@host:port")
+        self.assertEqual(parsed["port"], 5060)
+        self.assertEqual(parsed["host"], "host")
+
+    def test_missing_user_is_empty(self):
+        parsed = parse_sip_uri("sip:192.168.0.89")
+        self.assertEqual(parsed["user"], "")
+        self.assertEqual(parsed["host"], "192.168.0.89")
 
 
 class Response:

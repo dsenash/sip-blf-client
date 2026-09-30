@@ -12,5 +12,16 @@
     "call_duration": 30,
     "user_agent": "PythonSIP/1.0",
     "from_user": "100",
-    "display_name": "SIP Client"
+    "display_name": "SIP Client",
+    "sip_call_timeout": 30,
+    "blf": {
+        "enabled": false,
+        "domain": "default",
+        "expires": 3600,
+        "refresh": 1800,
+        "buttons": [
+            {"name": "101", "number": "101", "label": "Operator 1"},
+            {"name": "102", "number": "102", "label": "Manager"}
+        ]
+    }
 }

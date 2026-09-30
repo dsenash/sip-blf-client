@@ -1,13 +1,16 @@
-import json
-import argparse
-import socket
-import time
-import threading
+"""Entry point: one loop that serves the call, the BLF buttons and the console."""
 
-from sip_client import SIPClient, SIPMessage
-from rtp_sender import WAVStreamer, RTPMonitor
+import argparse
+import json
+import queue
+
+from blf import BLFManager, load_buttons, resolve_timing
+from call_session import CallSession, get_local_ip, parse_sip_uri
+from console import HELP_TEXT, StdinReader, parse_command
+from sip_client import SIPClient
 
 DEFAULT_CONFIG = "config.json"
+PROMPT = "blf> "
 
 
 def load_config(path):
@@ -22,100 +25,114 @@ def load_config(path):
         return {}
 
 
-def parse_sip_uri(uri):
-    """Parse a SIP URI like sip:101@192.168.0.89:5060;transport=udp."""
-    uri = uri.strip()
-    if uri.startswith("sip:"):
-        uri = uri[4:]
+def build_blf_manager(config, client, log=print):
+    """Build the subscription manager, or None when BLF should stay off.
 
-    transport = None
-    if ";transport=" in uri:
-        uri, params = uri.split(";", 1)
-        for param in params.split(";"):
-            if param.startswith("transport="):
-                transport = param.split("=")[1].lower()
-
-    if "@" in uri:
-        user, hostport = uri.split("@", 1)
-    else:
-        user, hostport = uri, ""
-
-    if ":" in hostport:
-        host, port = hostport.rsplit(":", 1)
-        try:
-            port = int(port)
-        except ValueError:
-            port = 5060
-    else:
-        host = hostport
-        port = 5060
-
-    return {"user": user, "host": host, "port": port, "transport": transport}
+    This never subscribes: the loop in main() owns the traffic, so building
+    the manager must not put anything on the wire.
+    """
+    section = config.get("blf") or {}
+    if not section.get("enabled"):
+        return None
+    buttons = load_buttons(config, log=log)
+    if not buttons:
+        log("[!] BLF is enabled but no buttons are configured")
+        return None
+    expires, refresh = resolve_timing(config, log=log)
+    return BLFManager(client, buttons, expires=expires, refresh=refresh, log=log)
 
 
-def get_local_ip(target_host):
-    """Determine the local IP address that would be used to reach target_host."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((target_host, 1))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+def render_blf_table(manager):
+    buttons = manager.snapshot()
+    if not buttons:
+        return "No BLF buttons configured."
+    header = f"{'NAME':<10} {'LABEL':<16} {'STATE':<9} CALLER"
+    lines = [header, "-" * len(header)]
+    for button in buttons:
+        if button.caller_number or button.caller_name:
+            caller = f"{button.caller_name or ''} <{button.caller_number or ''}>"
+        else:
+            caller = "-"
+        lines.append(f"{button.name:<10} {button.label:<16} {button.state:<9} {caller}")
+    return "\n".join(lines)
 
 
-def send_simple_response(client, msg, status, reason):
-    resp_headers = {
-        "Via": msg.headers.get("Via", ""),
-        "From": msg.headers.get("From", ""),
-        "To": msg.headers.get("To", ""),
-        "Call-ID": msg.headers.get("Call-ID", ""),
-        "CSeq": msg.headers.get("CSeq", ""),
-    }
-    rsp = SIPMessage(status_code=status, reason=reason)
-    for k, v in resp_headers.items():
-        rsp.add_header(k, v)
-    client._send(rsp.build().encode())
+class CommandContext:
+    def __init__(self, blf, session, client, target_host, target_port,
+                 wav_file, log=print):
+        self.blf = blf
+        self.session = session
+        self.client = client
+        self.target_host = target_host
+        self.target_port = target_port
+        self.wav_file = wav_file
+        self.log = log
 
 
-def handle_call(client, config, rtp_port, wav_file, call_duration, uri, to_tag):
-    sdp_info = client.parse_sdp(client.last_sdp)
-    if sdp_info["media_port"] and sdp_info["media_ip"]:
-        client.remote_rtp_addr = (sdp_info["media_ip"], sdp_info["media_port"])
-        print(f"[RTP] Remote media: {sdp_info['media_ip']}:{sdp_info['media_port']}")
-    else:
-        client.remote_rtp_addr = (client.remote_addr[0], client.remote_addr[1])
-        print(f"[RTP] No media in SDP, assuming SIP addr: {client.remote_rtp_addr}")
+def dispatch_command(parsed, ctx):
+    """Run one console command. Returns False when the caller should exit."""
+    if parsed is None:
+        return True
+    name, args = parsed
 
-    local_bind_ip = config.get("local_ip", "0.0.0.0")
-    if local_bind_ip == "0.0.0.0":
-        local_bind_ip = get_local_ip(client.remote_addr[0])
+    if name == "quit":
+        return False
 
-    rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    rtp_sock.bind((local_bind_ip, rtp_port))
+    if name == "help":
+        ctx.log(HELP_TEXT)
+        return True
 
-    monitor = RTPMonitor(rtp_sock, config)
-    monitor.start()
+    if name == "hangup":
+        ctx.session.hangup()
+        return True
 
-    streamer = WAVStreamer(wav_file, config)
-    sender_thread = threading.Thread(
-        target=streamer.send,
-        args=(rtp_sock, client.remote_rtp_addr, call_duration),
-        daemon=True,
-    )
-    sender_thread.start()
-    print(f"[RTP] Local: {local_bind_ip}:{rtp_port} -> Remote: {client.remote_rtp_addr[0]}:{client.remote_rtp_addr[1]}")
+    if name == "press":
+        if not args:
+            ctx.log("usage: press <name>")
+            return True
+        if ctx.blf is None:
+            ctx.log("[!] BLF is not active, cannot press a button")
+            return True
+        button = ctx.blf.get(args[0])
+        if button is None:
+            names = ", ".join(b.name for b in ctx.blf.snapshot())
+            ctx.log(f"[!] Unknown BLF button '{args[0]}'. Configured: {names}")
+            return True
+        uri = f"sip:{button.number}@{ctx.target_host}:{ctx.target_port}"
+        ctx.log(f"[*] Pressing {button.name} ({button.label}) -> {uri}")
+        if not ctx.session.start(uri):
+            ctx.log(f"[!] Cannot place call, a call is already {ctx.session.state}")
+        return True
 
-    client.rtp_sock = rtp_sock
-    client.monitor = monitor
+    if name == "blf":
+        if ctx.blf is None:
+            ctx.log("[!] BLF is not active")
+            return True
+        sub = args[0] if args else ""
+        if sub == "list":
+            ctx.log(render_blf_table(ctx.blf))
+        elif sub == "refresh":
+            ctx.blf.force_refresh()
+            ctx.log("[BLF] Re-subscribed all buttons")
+        else:
+            ctx.log("usage: blf list | blf refresh")
+        return True
+
+    ctx.log(f"[!] Unknown command '{name}'. Try 'help'.")
+    return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SIP client for sending INVITE and streaming WAV over RTP")
-    parser.add_argument("sip_uri", nargs="?", help="SIP URI (e.g. sip:101@192.168.0.89:5060;transport=udp)")
-    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"Path to config file (default: {DEFAULT_CONFIG})")
+    parser = argparse.ArgumentParser(
+        description="SIP client for sending INVITE and streaming WAV over RTP")
+    parser.add_argument("sip_uri", nargs="?",
+                        help="SIP URI (e.g. sip:101@192.168.0.89:5060;transport=udp)")
+    parser.add_argument("--config", default=DEFAULT_CONFIG,
+                        help=f"Path to config file (default: {DEFAULT_CONFIG})")
+    parser.add_argument("--blf", action="store_true",
+                        help="Subscribe to the BLF buttons in the config and enable the console")
+    parser.add_argument("--no-call", action="store_true",
+                        help="Do not place the startup call, only watch BLF")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -147,76 +164,73 @@ def main():
     client.local_port = config.get("local_port", 5080)
     client.transport = protocol
     client.open((target["host"], target["port"]))
-    dialog = client.create_dialog(uri)
 
-    print(f"[-] Sending INVITE to {uri}")
-    dialog.send_invite()
+    blf_mode = args.blf or bool((config.get("blf") or {}).get("enabled"))
+    blf = None
+    if blf_mode:
+        forced = dict(config)
+        forced["blf"] = dict(config.get("blf") or {}, enabled=True)
+        blf = build_blf_manager(forced, client)
+        if blf is not None:
+            blf.subscribe_all()
+        else:
+            print("[!] BLF mode requested but no buttons are available")
 
-    connected = False
-    to_tag = None
+    session = CallSession(client, config, rtp_port, wav_file, call_duration)
 
-    while True:
-        msg = client.receive(timeout=10)
-        if msg is None:
-            print("[!] Timeout waiting for SIP response")
-            break
+    if args.no_call and not blf_mode:
+        print("[!] --no-call without BLF, placing the call anyway")
+    if not args.no_call or not blf_mode:
+        session.start(uri)
 
-        if msg.method:
-            print(f"[SIP] Rx method: {msg.method}")
-            if msg.method == "INVITE":
-                print("         -> re-INVITE, answering 200 OK")
-            elif msg.method == "BYE":
-                print("[*] Received BYE, sending 200 OK")
-                send_simple_response(client, msg, 200, "OK")
-                break
-            continue
+    commands = queue.Queue()
+    reader = StdinReader(commands, prompt=PROMPT)
+    reader.start()
 
-        print(f"[SIP] {msg.status_code} {msg.reason}")
+    ctx = CommandContext(blf, session, client, target["host"], target["port"],
+                         wav_file)
 
-        if 100 <= msg.status_code < 200:
-            continue
+    print("[*] Console ready. Type 'help' for commands, Ctrl+C or 'quit' to exit.")
 
-        if msg.status_code == 200:
-            print("[+] INVITE accepted! Call connected.")
-            to_tag = None
-            if "To" in msg.headers and ";tag=" in msg.headers["To"]:
-                to_tag = msg.headers["To"].split(";tag=")[1].split(";")[0]
-            client.last_sdp = msg.body
-            dialog.send_ack(to_tag)
-            print("[+] ACK sent")
-            handle_call(client, config, rtp_port, wav_file, call_duration, uri, to_tag)
-            connected = True
-            break
-
-        if 300 <= msg.status_code < 400:
-            print(f"[!] Redirection {msg.status_code}, not following")
-            break
-
-        print(f"[!] Call failed: {msg.status_code} {msg.reason}")
-        break
-
-    if connected:
-        print("[*] Monitoring RTP and SIP traffic. Ctrl+C to hang up.")
-        try:
+    running = True
+    try:
+        while running:
             while True:
-                msg = client.receive(timeout=1)
-                if msg:
-                    if msg.method == "BYE":
-                        print("[*] Received BYE, sending 200 OK")
-                        send_simple_response(client, msg, 200, "OK")
-                        break
-                    elif msg.method == "INVITE":
-                        print("[SIP] re-INVITE ignored")
-        except KeyboardInterrupt:
-            print("\n[*] Interrupted")
-        finally:
-            print("[*] Sending BYE")
-            dialog.send_bye(to_tag)
-            time.sleep(1)
-            if getattr(client, "monitor", None):
-                client.monitor.stop()
-            client.close()
-            print("[+] Call ended")
+                try:
+                    line = commands.get_nowait()
+                except queue.Empty:
+                    break
+                if not dispatch_command(parse_command(line), ctx):
+                    running = False
+                    break
+            if not running:
+                break
+
+            if blf is not None:
+                blf.refresh_due()
+            session.tick()
+
+            msg = client.receive(timeout=0.5)
+            if msg is None:
+                continue
+            if msg.method == "NOTIFY":
+                if blf is not None:
+                    blf.handle_notify(msg)
+                continue
+            if blf is not None and blf.handle_response(msg):
+                continue
+            session.on_message(msg)
+            if session.finished and not blf_mode:
+                break
+    except KeyboardInterrupt:
+        print("\n[*] Interrupted")
+    finally:
+        reader.stop()
+        session.close()
+        if blf is not None:
+            blf.unsubscribe_all()
+        client.close()
+        print("[+] Exited")
 
 
 if __name__ == "__main__":
