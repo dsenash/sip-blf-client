@@ -137,3 +137,129 @@ def resolve_timing(config, log=print):
         log(f"[!] blf.refresh ({refresh}) >= blf.expires ({expires}), using {clamped}")
         refresh = clamped
     return expires, refresh
+
+
+class BLFManager:
+    """Owns the BLF subscription dialogs and the current state of each button.
+
+    It reads SIP messages but knows nothing about RTP or the dialplan. Pressing
+    a button is not its concern: callers resolve a button with get() and dial it.
+    """
+
+    def __init__(self, client, buttons, expires=3600, refresh=1800, log=print):
+        self.client = client
+        self.expires = expires
+        self.refresh = refresh
+        self.log = log
+        self.buttons = list(buttons)
+        self._dialogs = {}
+        self._next_refresh = {}
+        self._parse_failed = False
+        # NOTIFY bodies are keyed by the watched resource, which is what a real
+        # BLF watcher keys on. Fall back to the button name for entries whose
+        # name and number differ.
+        self._by_resource = {f"{b.number}@{b.domain}": b for b in self.buttons}
+
+    def get(self, name):
+        for button in self.buttons:
+            if button.name == name:
+                return button
+        return None
+
+    def snapshot(self):
+        return list(self.buttons)
+
+    def _find_by_resource(self, resource):
+        button = self._by_resource.get(resource)
+        if button is not None:
+            return button
+        for candidate in self.buttons:
+            if candidate.name == resource:
+                return candidate
+        return None
+
+    def _subscribe(self, button):
+        dialog = self._dialogs.get(button.name)
+        if dialog is None:
+            dialog = self.client.create_dialog(button.subscribe_uri)
+            self._dialogs[button.name] = dialog
+            dialog.send_subscribe("dialog", "application/blf+xml", self.expires,
+                                  f"blf-{button.name}@{button.domain}")
+            self.log(f"[BLF] SUBSCRIBE {button.name} -> {button.subscribe_uri} "
+                     f"(expires={self.expires})")
+        else:
+            dialog.send_refresh(self.expires)
+            self.log(f"[BLF] REFRESH {button.name} (expires={self.expires})")
+        self._next_refresh[button.name] = time.time() + self.refresh
+
+    def subscribe_all(self):
+        for button in self.buttons:
+            self._subscribe(button)
+
+    def force_refresh(self):
+        for button in self.buttons:
+            dialog = self._dialogs.get(button.name)
+            if dialog is not None:
+                dialog.send_refresh(self.expires)
+                self._next_refresh[button.name] = time.time() + self.refresh
+
+    def refresh_due(self):
+        now = time.time()
+        for button in self.buttons:
+            if now >= self._next_refresh.get(button.name, 0.0):
+                self._subscribe(button)
+
+    def unsubscribe_all(self):
+        for button in self.buttons:
+            dialog = self._dialogs.get(button.name)
+            if dialog is not None:
+                dialog.send_unsubscribe()
+                self.log(f"[BLF] UNSUBSCRIBE {button.name}")
+
+    def handle_notify(self, msg):
+        """Update button state from a NOTIFY. Returns the buttons that changed."""
+        if msg.method != "NOTIFY":
+            return []
+        if "blf+xml" not in msg.headers.get("Content-Type", ""):
+            return []
+
+        try:
+            instances = parse_blf_xml(msg.body)
+        except BLFParseError as e:
+            if not self._parse_failed:
+                self._parse_failed = True
+                self.log(f"[!] BLF NOTIFY body could not be parsed: {e}")
+            return []
+        self._parse_failed = False
+
+        changed = []
+        for resource, params in instances.items():
+            button = self._find_by_resource(resource)
+            if button is not None and button.apply(params):
+                changed.append(button)
+
+        for button in changed:
+            self.log(format_change(button))
+        return changed
+
+    def handle_response(self, msg):
+        """Route a subscription response.
+
+        Returns True when the response belongs to a BLF subscription, so the
+        caller can keep it away from the call state machine. A rejected
+        SUBSCRIBE is logged with its status code and the button keeps whatever
+        state it had, which for a never-delivered subscription is "unknown".
+        """
+        if msg.status_code is None:
+            return False
+        call_id = msg.headers.get("Call-ID", "")
+        for name, dialog in self._dialogs.items():
+            if dialog.call_id != call_id:
+                continue
+            code = msg.status_code
+            if 200 <= code < 300:
+                self.log(f"[BLF] SUBSCRIBE {name} accepted ({code} {msg.reason})")
+            else:
+                self.log(f"[!] BLF SUBSCRIBE {name} rejected: {code} {msg.reason}")
+            return True
+        return False
