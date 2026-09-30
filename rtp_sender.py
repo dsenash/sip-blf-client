@@ -10,7 +10,11 @@ import random
 class RPTPacket:
     @staticmethod
     def build(seq, timestamp, ssrc, payload, payload_type=0):
-        header = struct.pack("!BBHII", 0x80 | payload_type, payload_type, seq, timestamp, ssrc)
+        # seq is 16-bit and timestamp 32-bit on the wire, so both must wrap.
+        # The sender counts past the limit mid-call, and struct.pack raises
+        # there rather than truncating, which killed the streaming thread.
+        header = struct.pack("!BBHII", 0x80 | payload_type, payload_type,
+                             seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc)
         return header + payload
 
     @staticmethod
