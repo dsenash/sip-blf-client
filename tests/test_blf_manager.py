@@ -2,6 +2,7 @@ import time
 import unittest
 
 from blf import BLFButton, BLFManager
+from sip_client import SIPHeaders
 
 NS = 'xmlns="urn:freedeswitch:blf"'
 
@@ -66,7 +67,7 @@ class FakeMessage:
     def __init__(self, method, body="", headers=None, status_code=None, reason=None):
         self.method = method
         self.body = body
-        self.headers = headers or {}
+        self.headers = SIPHeaders(headers or {})
         self.status_code = status_code
         self.reason = reason
 
@@ -77,7 +78,7 @@ class Response:
         self.status_code = code
         self.reason = reason
         self.body = ""
-        self.headers = headers or {}
+        self.headers = SIPHeaders(headers or {})
 
 
 def notify(instances_xml):
@@ -504,3 +505,34 @@ class TerminatedSubscriptionTest(unittest.TestCase):
     def test_active_state_is_not_logged_as_a_problem(self):
         self.manager.handle_notify(self.notify("active"))
         self.assertNotIn("terminated", self.log)
+
+
+class MultiViaNotifyTest(unittest.TestCase):
+    """A NOTIFY that crossed a proxy arrives with one Via per hop, and the
+    200 OK has to carry all of them back in order or the proxy that sent it
+    cannot route the answer."""
+
+    def setUp(self):
+        self.client, self.manager, self.log = make_manager()
+        msg = FakeMessage(
+            "NOTIFY",
+            body='<?xml version="1.0"?><event name="dialog" '
+                 'xmlns="urn:freedeswitch:blf"><instance name="101@default">'
+                 '<params><param name="rpid" value="idle"/></params>'
+                 "</instance></event>",
+            headers={"Content-Type": "application/blf+xml", "Call-ID": "w",
+                     "CSeq": "1 NOTIFY", "From": "f", "To": "t"})
+        msg.headers.append("Via", "SIP/2.0/UDP proxy;branch=1")
+        msg.headers.append("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=2")
+        self.msg = msg
+
+    def test_answered_with_every_via_in_order(self):
+        self.manager.handle_notify(self.msg)
+        answer = self.client.sent[0].decode()
+        self.assertEqual(answer.count("Via: "), 2)
+        self.assertLess(answer.index("proxy;branch=1"),
+                        answer.index("10.0.0.1:5060;branch=2"))
+
+    def test_still_updates_the_button(self):
+        self.manager.handle_notify(self.msg)
+        self.assertEqual(self.manager.get("101").state, "idle")

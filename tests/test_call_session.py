@@ -1,6 +1,7 @@
 import unittest
 
 from call_session import CallSession, extract_tag, parse_sip_uri
+from sip_client import SIPHeaders
 
 
 class ParseSipUriTest(unittest.TestCase):
@@ -46,7 +47,7 @@ class Response:
         self.method = None
         self.status_code = code
         self.reason = reason
-        self.headers = headers or {}
+        self.headers = SIPHeaders(headers or {})
         self.body = body
 
 
@@ -55,7 +56,7 @@ class Request:
         self.method = method
         self.status_code = None
         self.reason = None
-        self.headers = headers or {}
+        self.headers = SIPHeaders(headers or {})
         self.body = body
 
 

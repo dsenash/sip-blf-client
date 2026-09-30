@@ -13,11 +13,18 @@ class SIPHeaders(dict):
     other stacks send "content-type", and a case-sensitive miss silently
     dropped NOTIFY bodies. The original casing is kept as the real key so
     that build() still writes headers the way the caller spelled them.
+
+    A header may legally appear more than once and a dict cannot hold that, so
+    append() keeps every copy in arrival order while get() answers with the
+    last one, which is what the single-valued lookups here expect. Assigning
+    with [] replaces the header outright, so builder code that sets a header
+    twice does not emit it twice.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__()
         self._spelling = {}
+        self._values = []
         self.update(dict(*args, **kwargs))
 
     def _actual(self, key):
@@ -27,14 +34,34 @@ class SIPHeaders(dict):
         if not isinstance(key, str):
             super().__setitem__(key, value)
             return
+        actual = self._set_spelling(key)
+        copies = [i for i, (name, _) in enumerate(self._values) if name == actual]
+        if copies:
+            # Keep the position of the header it replaces.
+            self._values[copies[-1]] = (actual, value)
+            self._values = [(n, v) for i, (n, v) in enumerate(self._values)
+                            if i in copies[:-1] or i == copies[-1]]
+        else:
+            self._values.append((actual, value))
+        super().__setitem__(actual, value)
+
+    def append(self, key, value):
+        """Add another copy of a header that is allowed to repeat."""
+        actual = self._set_spelling(key)
+        self._values.append((actual, value))
+        super().__setitem__(actual, value)
+
+    def _set_spelling(self, key):
         self._spelling.setdefault(key.lower(), key)
-        super().__setitem__(self._spelling[key.lower()], value)
+        return self._spelling[key.lower()]
 
     def __getitem__(self, key):
         return super().__getitem__(self._actual(key))
 
     def __delitem__(self, key):
-        super().__delitem__(self._actual(key))
+        actual = self._actual(key)
+        super().__delitem__(actual)
+        self._values = [(n, v) for n, v in self._values if n != actual]
         if isinstance(key, str):
             self._spelling.pop(key.lower(), None)
 
@@ -45,7 +72,9 @@ class SIPHeaders(dict):
         return super().get(self._actual(key), default)
 
     def pop(self, key, *args):
-        return super().pop(self._actual(key), *args)
+        actual = self._actual(key)
+        self._values = [(n, v) for n, v in self._values if n != actual]
+        return super().pop(actual, *args)
 
     def setdefault(self, key, default=None):
         if key not in self:
@@ -55,6 +84,15 @@ class SIPHeaders(dict):
     def update(self, other=(), **kwargs):
         for name, value in dict(other, **kwargs).items():
             self[name] = value
+
+    def all_values(self, key):
+        """Every copy of one header, in the order it arrived."""
+        actual = self._actual(key)
+        return [value for name, value in self._values if name == actual]
+
+    def items_in_order(self):
+        """Every header copy in wire order, repeats included."""
+        return list(self._values)
 
 
 class SIPMessage:
@@ -67,7 +105,8 @@ class SIPMessage:
         self.body = ""
 
     def add_header(self, name, value):
-        self.headers[name] = value
+        """Add a header. Repeating the name adds another copy, per RFC 3261."""
+        self.headers.append(name, value)
 
     def build(self):
         if self.method:
@@ -75,12 +114,16 @@ class SIPMessage:
         else:
             lines = [f"SIP/2.0 {self.status_code} {self.reason}"]
 
-        headers = dict(self.headers)
         # Content-Length is emitted exactly once. An explicit header set by the
         # builder wins; otherwise it is computed from the body.
-        content_length = headers.pop("Content-Length", None)
+        content_length = self.headers.get("Content-Length")
 
-        for name, value in headers.items():
+        # Repeated headers are written as one line per copy: RFC 3261 does not
+        # allow them to be joined with commas, and a response must carry every
+        # Via of the request it answers.
+        for name, value in self.headers.items_in_order():
+            if name == "Content-Length":
+                continue
             lines.append(f"{name}: {value}")
 
         if content_length is None:
@@ -130,7 +173,8 @@ class SIPMessage:
             # HCOLON does not require the space, and real servers omit it.
             if ":" in line:
                 name, value = line.split(":", 1)
-                msg.headers[name.strip()] = value.strip()
+                # append, not assignment: Via is routinely sent once per hop.
+                msg.headers.append(name.strip(), value.strip())
             i += 1
 
         msg.body = "\r\n".join(lines[i:]) if i < len(lines) else ""

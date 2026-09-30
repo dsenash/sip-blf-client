@@ -24,7 +24,11 @@ def extract_tag(header_value):
 def send_simple_response(client, msg, status, reason):
     """Answer a server-initiated request (BYE, re-INVITE) with a bare response."""
     rsp = SIPMessage(status_code=status, reason=reason)
-    for name in ("Via", "From", "To", "Call-ID", "CSeq"):
+    # RFC 3261 8.2.6.2: a response carries one Via per Via of the request, in
+    # the same order. Dropping one makes a proxy drop the response.
+    for value in msg.headers.all_values("Via"):
+        rsp.headers.append("Via", value)
+    for name in ("From", "To", "Call-ID", "CSeq"):
         rsp.add_header(name, msg.headers.get(name, ""))
     client.send(rsp.build().encode())
 

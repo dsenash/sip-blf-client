@@ -76,5 +76,47 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(msg.body, "<xml")
 
 
+class RepeatedHeaderTest(unittest.TestCase):
+    """A request may carry the same header more than once, and the answer must
+    copy every one of them. Collapsing them kept only the last Via, so a
+    response through a proxy chain was routed to the wrong hop, and the next
+    leg never got one at all."""
+
+    def test_all_values_returns_every_copy_in_order(self):
+        msg = SIPMessage.parse(wire(
+            "NOTIFY sip:101@default SIP/2.0",
+            "Via: SIP/2.0/UDP proxy1;branch=1",
+            "Via: SIP/2.0/UDP edge;branch=2",
+            "Call-ID: c"))
+        self.assertEqual(msg.headers.all_values("Via"),
+                         ["SIP/2.0/UDP proxy1;branch=1",
+                          "SIP/2.0/UDP edge;branch=2"])
+
+    def test_all_values_returns_a_single_copy_unchanged(self):
+        msg = SIPMessage.parse(wire("SIP/2.0 200 OK", "Call-ID: abc"))
+        self.assertEqual(msg.headers.all_values("Call-ID"), ["abc"])
+
+    def test_all_values_of_an_absent_header_is_empty(self):
+        msg = SIPMessage()
+        self.assertEqual(msg.headers.all_values("Via"), [])
+
+    def test_build_repeats_a_multi_valued_header(self):
+        msg = SIPMessage(status_code=200, reason="OK")
+        msg.add_header("Via", "SIP/2.0/UDP proxy1;branch=1")
+        msg.add_header("Via", "SIP/2.0/UDP edge;branch=2")
+        built = msg.build()
+        self.assertEqual(built.count("Via: "), 2)
+
+    def test_ordinary_headers_are_still_emitted_once(self):
+        msg = SIPMessage(status_code=200, reason="OK")
+        msg.add_header("Call-ID", "c")
+        self.assertEqual(msg.build().count("Call-ID: "), 1)
+
+    def test_deleting_a_header_removes_every_copy(self):
+        msg = SIPMessage.parse(wire("SIP/2.0 200 OK", "Via: a", "Via: b"))
+        del msg.headers["Via"]
+        self.assertEqual(msg.headers.all_values("Via"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

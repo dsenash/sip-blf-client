@@ -128,6 +128,68 @@ def dispatch_command(parsed, ctx):
     return True
 
 
+# A socket that keeps failing would otherwise spin here at full speed, since
+# the error is returned immediately rather than after the receive timeout.
+MAX_CONSECUTIVE_ERRORS = 20
+
+
+def run_loop(client, session, blf, commands, blf_mode, target_host=None,
+             target_port=None, wav_file=None, log=print):
+    """Serve the call, the BLF buttons and the console until 'quit'.
+
+    The spec asks for a socket error to be logged with the loop continuing.
+    A UDP socket reports ICMP errors from earlier datagrams on later sends, so
+    an unreachable peer would otherwise take the whole client down and drop
+    every subscription with it.
+    """
+    ctx = CommandContext(blf, session, client, target_host, target_port,
+                         wav_file, log=log)
+    running = True
+    consecutive_errors = 0
+    while running:
+        while True:
+            try:
+                line = commands.get_nowait()
+            except queue.Empty:
+                break
+            if not dispatch_command(parse_command(line), ctx):
+                running = False
+                break
+        if not running:
+            break
+
+        try:
+            if blf is not None:
+                blf.refresh_due()
+            session.tick()
+            # Checked here, before receive(): a call can end in tick() without
+            # any further SIP traffic arriving, and the `msg is None` branch
+            # below would otherwise skip this and spin forever.
+            if session.finished and not blf_mode:
+                break
+
+            msg = client.receive(timeout=0.5)
+            if msg is None:
+                consecutive_errors = 0
+                continue
+            if msg.method == "NOTIFY":
+                if blf is not None:
+                    blf.handle_notify(msg)
+                consecutive_errors = 0
+                continue
+            if blf is not None and blf.handle_response(msg):
+                consecutive_errors = 0
+                continue
+            session.on_message(msg)
+            consecutive_errors = 0
+        except OSError as e:
+            consecutive_errors += 1
+            log(f"[!] Socket error: {e}")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                log("[!] Too many socket errors, giving up")
+                break
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SIP client for sending INVITE and streaming WAV over RTP")
@@ -193,52 +255,30 @@ def main():
     reader = StdinReader(commands, prompt=PROMPT)
     reader.start()
 
-    ctx = CommandContext(blf, session, client, target["host"], target["port"],
-                         wav_file)
-
     print("[*] Console ready. Type 'help' for commands, Ctrl+C or 'quit' to exit.")
 
-    running = True
     try:
-        while running:
-            while True:
-                try:
-                    line = commands.get_nowait()
-                except queue.Empty:
-                    break
-                if not dispatch_command(parse_command(line), ctx):
-                    running = False
-                    break
-            if not running:
-                break
-
-            if blf is not None:
-                blf.refresh_due()
-            session.tick()
-            # Checked here, before receive(): a call can end in tick() without
-            # any further SIP traffic arriving, and the `msg is None` branch
-            # below would otherwise skip this and spin forever.
-            if session.finished and not blf_mode:
-                break
-
-            msg = client.receive(timeout=0.5)
-            if msg is None:
-                continue
-            if msg.method == "NOTIFY":
-                if blf is not None:
-                    blf.handle_notify(msg)
-                continue
-            if blf is not None and blf.handle_response(msg):
-                continue
-            session.on_message(msg)
+        run_loop(client, session, blf, commands, blf_mode,
+                 target["host"], target["port"], wav_file)
     except KeyboardInterrupt:
         print("\n[*] Interrupted")
     finally:
         reader.stop()
-        session.close()
+        # Each of these touches the socket that may be the thing that just
+        # failed, so none of them may stop the others from running.
+        try:
+            session.close()
+        except OSError as e:
+            print(f"[!] Error closing the call: {e}")
         if blf is not None:
-            blf.unsubscribe_all()
-        client.close()
+            try:
+                blf.unsubscribe_all()
+            except OSError as e:
+                print(f"[!] Error sending UNSUBSCRIBE: {e}")
+        try:
+            client.close()
+        except OSError as e:
+            print(f"[!] Error closing the socket: {e}")
         print("[+] Exited")
 
 

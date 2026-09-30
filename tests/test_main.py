@@ -1,8 +1,11 @@
+import os
+import subprocess
+import sys
 import unittest
 
 from blf import BLFButton
 from console import parse_command
-from main import (CommandContext, build_blf_manager, dispatch_command,
+from main import (CommandContext, build_blf_manager, dispatch_command, run_loop,
                   render_blf_table)
 
 
@@ -245,6 +248,250 @@ class DispatchTest(unittest.TestCase):
         for line in ("help", "blf list", "blf refresh", "hangup", "press 101",
                      "frobnicate"):
             dispatch_command(parse_command(line), ctx)
+
+
+class LoopClient:
+    """A client whose socket misbehaves on cue, the way a real one does.
+
+    Once the scripted events run out it queues a 'quit', which stands in for a
+    user typing at the console.
+    """
+
+    def __init__(self, events, commands=None, quit_after=3):
+        self.events = list(events)
+        self.commands = commands
+        self.quit_after = quit_after
+        self.idle = 0
+        self.received = []
+
+    def receive(self, timeout=0.5):
+        if not self.events:
+            self.idle += 1
+            if self.commands is not None and self.idle >= self.quit_after:
+                self.commands.put("quit")
+                self.commands = None
+            return None
+        event = self.events.pop(0)
+        if isinstance(event, Exception):
+            raise event
+        return event
+
+    def close(self):
+        self.closed = True
+
+
+class LoopSession:
+    def __init__(self):
+        self.state = "idle"
+        self.finished = False
+        self.ticked = 0
+        self.closed = 0
+
+    def tick(self):
+        self.ticked += 1
+
+    def close(self):
+        self.closed += 1
+
+    def hangup(self):
+        pass
+
+    def on_message(self, msg):
+        pass
+
+
+class LoopBlf:
+    def __init__(self):
+        self.refreshed = 0
+        self.unsubscribed = 0
+        self.raise_on_unsubscribe = False
+
+    def refresh_due(self):
+        self.refreshed += 1
+
+    def handle_notify(self, msg):
+        return True
+
+    def handle_response(self, msg):
+        return False
+
+    def unsubscribe_all(self):
+        self.unsubscribed += 1
+        if self.raise_on_unsubscribe:
+            raise OSError(9, "Bad file descriptor")
+
+
+class RunLoopTest(unittest.TestCase):
+    """The spec requires a socket error during a send to be logged with the
+    loop continuing. Nothing caught it: main() caught KeyboardInterrupt only,
+    so one ICMP-unreachable datagram, which a UDP socket reports as ECONNREFUSED
+    on the next send, took the whole client down along with its subscriptions.
+    """
+
+    def run_it(self, events, commands=(), blf=None, timeout=5):
+        import queue
+        import threading
+        q = queue.Queue()
+        for line in commands:
+            q.put(line)
+        client = LoopClient(events, q)
+        session = LoopSession()
+        self.session = session
+        log = RecordingLog()
+        error = []
+
+        def target():
+            try:
+                run_loop(client, session, blf, q, False, log=log)
+            except BaseException as exc:      # noqa: BLE001 - reported below
+                error.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        self.assertFalse(thread.is_alive(), "run_loop did not return")
+        if error:
+            raise error[0]
+        return client, self.session, log
+
+    def test_receive_socket_error_is_logged_and_the_loop_continues(self):
+        # run_it raises anything that escapes, so returning at all is the
+        # assertion that the loop continued rather than propagating.
+        client, session, log = self.run_it([OSError(111, "Connection refused")])
+        self.assertIn("[!] Socket error: [Errno 111] Connection refused", log)
+
+    def test_the_loop_keeps_working_after_a_socket_error(self):
+        client, session, log = self.run_it([OSError(111, "Connection refused")])
+        self.assertGreater(session.ticked, 1)
+
+    def test_a_persistently_failing_socket_eventually_gives_up(self):
+        # 21 identical failures means the socket is gone, not that the peer is
+        # briefly busy. Spinning at full speed would peg a CPU forever.
+        client, session, log = self.run_it([OSError(111, "Connection refused")] * 21)
+        self.assertIn("Too many socket errors", log)
+
+    def test_refresh_errors_are_logged_and_the_loop_continues(self):
+        class BadBlf(LoopBlf):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def refresh_due(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError(111, "Connection refused")
+
+        client, session, log = self.run_it([], blf=BadBlf())
+        self.assertIn("Connection refused", log)
+        self.assertGreater(session.ticked, 1)
+
+    def test_run_loop_leaves_the_shutdown_to_its_caller(self):
+        # main() closes the session, unsubscribes and closes the socket. The
+        # loop must not also do it, or the call would be torn down twice.
+        client, session, log = self.run_it([])
+        self.assertFalse(hasattr(client, "closed"))
+
+    def test_quit_returns_without_waiting_on_the_network(self):
+        client, session, log = self.run_it([], commands=("quit",))
+        self.assertEqual(client.events, [])
+
+    def test_a_call_that_finishes_without_traffic_ends_the_loop(self):
+        session = LoopSession()
+        session.finished = True
+        q = __import__("queue").Queue()
+        client = LoopClient([], q)
+        log = RecordingLog()
+        run_loop(client, session, None, q, False, log=log)
+        self.assertEqual(session.ticked, 1)
+
+
+class MainProcessTest(unittest.TestCase):
+    """Run main.py as a process.
+
+    A NameError in main() took the client down with a traceback while every
+    unit test still passed, because nothing ran main() itself.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def run_main(self, config_text, args=(), commands="quit", timeout=15):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as handle:
+                handle.write(config_text)
+            proc = subprocess.run(
+                [sys.executable, "main.py", "--config", path, *args],
+                cwd=self.ROOT, input=commands, capture_output=True,
+                text=True, timeout=timeout)
+        return proc
+
+    def test_exits_cleanly_after_quit(self):
+        proc = self.run_main('{"target_port": 15099}')
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("[+] Exited", proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def run_main_holding_stdin(self, config_text, timeout=20):
+        """Start main.py and leave stdin open, as a real terminal would.
+
+        Closing stdin makes StdinReader see EOF, which quits by design, so a
+        test that means to wait out a timeout has to keep the pipe open.
+        """
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as handle:
+                handle.write(config_text)
+            proc = subprocess.Popen(
+                [sys.executable, "main.py", "--config", path],
+                cwd=self.ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            # communicate() would close stdin, which is the one thing this test
+            # must not do: EOF quits by design and hides the timeout.
+            collected = {}
+
+            def drain(name, stream):
+                collected[name] = stream.read()
+
+            threads = [threading.Thread(target=drain, args=("out", proc.stdout)),
+                       threading.Thread(target=drain, args=("err", proc.stderr))]
+            for thread in threads:
+                thread.daemon = True
+                thread.start()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                self.fail("main.py did not exit on its own")
+            for thread in threads:
+                thread.join(5)
+        return proc.returncode, collected.get("out", ""), collected.get("err", "")
+
+    def test_a_call_that_times_out_ends_the_process(self):
+        # Nothing is listening on 15099, so the INVITE is never answered. The
+        # call must time out and take the process down on its own rather than
+        # waiting at the console for a user who has nothing to press.
+        code, out, err = self.run_main_holding_stdin(
+            '{"target_port": 15099, "sip_call_timeout": 1}')
+        self.assertEqual(code, 0)
+        self.assertIn("[!] Timeout waiting for SIP response", out)
+        self.assertNotIn("Traceback", err)
+
+    def test_an_unanswered_invite_is_cancelled_on_timeout(self):
+        code, out, err = self.run_main_holding_stdin(
+            '{"target_port": 15099, "sip_call_timeout": 1}')
+        self.assertIn("Cancelling the unanswered INVITE", out)
+
+    def test_help_exits_cleanly(self):
+        proc = subprocess.run([sys.executable, "main.py", "--help"],
+                              cwd=self.ROOT, capture_output=True, text=True,
+                              timeout=15)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", proc.stderr)
 
 
 if __name__ == "__main__":
