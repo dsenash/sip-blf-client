@@ -23,13 +23,17 @@ class SIPMessage:
         else:
             lines = [f"SIP/2.0 {self.status_code} {self.reason}"]
 
-        for name, value in self.headers.items():
+        headers = dict(self.headers)
+        # Content-Length is emitted exactly once. An explicit header set by the
+        # builder wins; otherwise it is computed from the body.
+        content_length = headers.pop("Content-Length", None)
+
+        for name, value in headers.items():
             lines.append(f"{name}: {value}")
 
-        if self.body:
-            lines.append(f"Content-Length: {len(self.body)}")
-        else:
-            lines.append("Content-Length: 0")
+        if content_length is None:
+            content_length = len(self.body.encode()) if self.body else 0
+        lines.append(f"Content-Length: {content_length}")
 
         lines.append("")
         lines.append(self.body if self.body else "")
@@ -154,6 +158,41 @@ class SIPDialog:
     def build_bye(self, to_tag=None):
         return self._build("BYE", self._next_cseq(), to_tag=to_tag)
 
+    def _subscription_extra(self, event, accept, expires, event_id):
+        return [
+            ("Event", event),
+            ("Accept", accept),
+            ("Expires", str(expires)),
+            ("Event-ID", event_id),
+            ("Supported", "eventlist, dialog, call-info, terminate"),
+        ]
+
+    def build_subscribe(self, event, accept, expires, event_id):
+        self.event = event
+        self.accept = accept
+        self.event_id = event_id
+        return self._build(
+            "SUBSCRIBE",
+            self._next_cseq(),
+            extra=self._subscription_extra(event, accept, expires, event_id),
+        )
+
+    def build_refresh(self, expires):
+        return self._build(
+            "SUBSCRIBE",
+            self._next_cseq(),
+            extra=self._subscription_extra(self.event, self.accept, expires,
+                                          self.event_id),
+        )
+
+    def build_unsubscribe(self):
+        return self._build(
+            "SUBSCRIBE",
+            self._next_cseq(),
+            extra=self._subscription_extra(self.event, self.accept, 0,
+                                          self.event_id),
+        )
+
     def send_invite(self):
         return self.client.send(self.build_invite().build().encode())
 
@@ -162,6 +201,16 @@ class SIPDialog:
 
     def send_bye(self, to_tag=None):
         return self.client.send(self.build_bye(to_tag).build().encode())
+
+    def send_subscribe(self, event, accept, expires, event_id):
+        return self.client.send(
+            self.build_subscribe(event, accept, expires, event_id).build().encode())
+
+    def send_refresh(self, expires):
+        return self.client.send(self.build_refresh(expires).build().encode())
+
+    def send_unsubscribe(self):
+        return self.client.send(self.build_unsubscribe().build().encode())
 
 
 class SIPClient:

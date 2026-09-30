@@ -90,5 +90,101 @@ class SIPClientTest(unittest.TestCase):
             make_client().send(b"test")
 
 
+class SubscribeMessageShapeTest(unittest.TestCase):
+    """A SUBSCRIBE reuses the dialog's identity, per RFC 6665."""
+
+    def setUp(self):
+        self.client = make_client()
+        self.dialog = self.client.create_dialog("sip:101@default")
+
+    def test_subscribe_uses_cseq_one(self):
+        msg = self.dialog.build_subscribe("dialog", "application/blf+xml",
+                                          3600, "blf-101@default")
+        self.assertEqual(msg.method, "SUBSCRIBE")
+        self.assertEqual(msg.uri, "sip:101@default")
+        self.assertEqual(msg.headers["CSeq"], "1 SUBSCRIBE")
+
+    def test_subscribe_carries_blf_headers(self):
+        msg = self.dialog.build_subscribe("dialog", "application/blf+xml",
+                                          3600, "blf-101@default")
+        self.assertEqual(msg.headers["Event"], "dialog")
+        self.assertEqual(msg.headers["Accept"], "application/blf+xml")
+        self.assertEqual(msg.headers["Expires"], "3600")
+        self.assertEqual(msg.headers["Event-ID"], "blf-101@default")
+        self.assertIn("dialog", msg.headers["Supported"])
+        self.assertEqual(msg.headers["Content-Length"], "0")
+        self.assertEqual(msg.body, "")
+
+    def test_refresh_reuses_call_id_and_increments_cseq(self):
+        first = self.dialog.build_subscribe("dialog", "application/blf+xml",
+                                            3600, "blf-101@default")
+        again = self.dialog.build_refresh(1800)
+        self.assertEqual(again.headers["Call-ID"], first.headers["Call-ID"])
+        self.assertEqual(again.headers["CSeq"], "2 SUBSCRIBE")
+        self.assertEqual(again.headers["Expires"], "1800")
+        self.assertEqual(again.headers["Event-ID"], "blf-101@default")
+
+    def test_unsubscribe_expires_zero(self):
+        self.dialog.build_subscribe("dialog", "application/blf+xml",
+                                    3600, "blf-101@default")
+        msg = self.dialog.build_unsubscribe()
+        self.assertEqual(msg.method, "SUBSCRIBE")
+        self.assertEqual(msg.headers["Expires"], "0")
+        self.assertEqual(msg.headers["CSeq"], "2 SUBSCRIBE")
+
+    def test_subscription_dialog_does_not_disturb_a_call_dialog(self):
+        call = self.client.create_dialog("sip:200@192.168.0.89:5060")
+        call.build_invite()
+        self.dialog.build_subscribe("dialog", "application/blf+xml",
+                                    3600, "blf-101@default")
+        bye = call.build_bye(to_tag="remoteTAG")
+        self.assertEqual(bye.headers["CSeq"], "2 BYE")
+        self.assertEqual(bye.headers["Call-ID"], call.call_id)
+
+
+class SerializedWireTest(unittest.TestCase):
+    """Header ordering is not significant, but a duplicated header is a defect."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    @staticmethod
+    def header_count(raw, name):
+        return sum(1 for line in raw.split("\r\n") if line.startswith(f"{name}:"))
+
+    def test_subscribe_emits_content_length_exactly_once(self):
+        dialog = self.client.create_dialog("sip:101@default")
+        raw = dialog.build_subscribe("dialog", "application/blf+xml",
+                                     3600, "blf-101@default").build()
+        self.assertEqual(self.header_count(raw, "Content-Length"), 1)
+
+    def test_invite_emits_content_length_exactly_once(self):
+        dialog = self.client.create_dialog("sip:101@192.168.0.89:5060")
+        raw = dialog.build_invite().build()
+        self.assertEqual(self.header_count(raw, "Content-Length"), 1)
+
+    def test_content_length_matches_the_body(self):
+        dialog = self.client.create_dialog("sip:101@192.168.0.89:5060")
+        raw = dialog.build_invite().build()
+        lines = raw.split("\r\n")
+        declared = next(int(ln.split(":", 1)[1])
+                        for ln in lines if ln.startswith("Content-Length:"))
+        body = raw.split("\r\n\r\n", 1)[1]
+        self.assertEqual(declared, len(body.encode()))
+
+    def test_ack_and_bye_emit_content_length_exactly_once(self):
+        dialog = self.client.create_dialog("sip:101@192.168.0.89:5060")
+        dialog.build_invite()
+        for raw in (dialog.build_ack(to_tag="t").build(),
+                    dialog.build_bye(to_tag="t").build()):
+            self.assertEqual(self.header_count(raw, "Content-Length"), 1)
+
+    def test_wire_uses_crlf_only(self):
+        dialog = self.client.create_dialog("sip:101@default")
+        raw = dialog.build_subscribe("dialog", "application/blf+xml",
+                                     3600, "blf-101@default").build()
+        self.assertNotIn("\n", raw.replace("\r\n", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
