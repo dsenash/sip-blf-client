@@ -861,6 +861,7 @@ class BLFButton:
         self.changed_at = time.time()
 
     @property
+    @property
     def subscribe_uri(self):
         return f"sip:{self.number}@{self.domain}"
 
@@ -1254,8 +1255,12 @@ class SubscribeTest(unittest.TestCase):
         self.assertEqual(len(client.dialogs[1].unsubscribes), 1)
 
     def test_unsubscribe_before_subscribe_is_harmless(self):
-        _, manager, log = make_manager()
+        client, manager, log = make_manager()
         manager.unsubscribe_all()
+        # Nothing to unsubscribe, so no dialog may be conjured up and nothing
+        # may be logged.
+        self.assertEqual(client.dialogs, [])
+        self.assertEqual([line for line in log.lines if "UNSUBSCRIBE" in line], [])
 
 
 class HandleNotifyTest(unittest.TestCase):
