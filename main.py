@@ -49,8 +49,14 @@ def render_blf_table(manager):
     header = f"{'NAME':<10} {'LABEL':<16} {'STATE':<9} CALLER"
     lines = [header, "-" * len(header)]
     for button in buttons:
-        if button.caller_number or button.caller_name:
-            caller = f"{button.caller_name or ''} <{button.caller_number or ''}>"
+        name = button.caller_name or ""
+        number = button.caller_number or ""
+        if name and number:
+            caller = f"{name} <{number}>"
+        elif number:
+            caller = number
+        elif name:
+            caller = name
         else:
             caller = "-"
         lines.append(f"{button.name:<10} {button.label:<16} {button.state:<9} {caller}")

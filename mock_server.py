@@ -3,6 +3,8 @@ import struct
 import time
 import threading
 import sys
+from xml.etree import ElementTree
+from xml.sax.saxutils import quoteattr
 
 
 def make_response(recv_msg, status, reason, extra_headers=None, body=""):
@@ -48,6 +50,61 @@ SDP_BODY = (
     "m=audio 12000 RTP/AVP 0 8 101\r\n"
     "a=rtpmap:0 PCMU/8000\r\n"
 )
+
+
+# After each SUBSCRIBE, walk this script: (delay_seconds, rpid, caller_number).
+BLF_SCRIPT = (
+    (0.0, "idle", None),
+    (3.0, "ringing", "5551234"),
+    (8.0, "idle", None),
+)
+
+
+def make_notify_body(instances):
+    """Build a BLF NOTIFY body from (name, rpid, caller_number) tuples."""
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<event name="dialog" xmlns="urn:freedeswitch:blf">']
+    for name, rpid, caller_number in instances:
+        parts.append(f"  <instance name={quoteattr(name)}>")
+        parts.append("    <params>")
+        parts.append(f'      <param name="rpid" value={quoteattr(rpid or "")}/>')
+        if caller_number:
+            parts.append("      <param name=\"caller_id_number\" "
+                         f"value={quoteattr(caller_number)}/>")
+        parts.append("    </params>")
+        parts.append("  </instance>")
+    parts.append("</event>")
+    return "\r\n".join(parts)
+
+
+def _first_resource(body):
+    """The NOTIFY Request-URI is the watched resource, taken from the body."""
+    for node in ElementTree.fromstring(body).iter():
+        if node.tag.endswith("instance") and node.get("name"):
+            return node.get("name")
+    return ""
+
+
+def make_notify(call_id, from_tag, to_tag, cseq, event_id, body):
+    """Build a complete NOTIFY request reusing an existing subscription dialog."""
+    lines = [
+        f"NOTIFY sip:{_first_resource(body)} SIP/2.0",
+        f"Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bKmock{cseq};rport",
+        "Max-Forwards: 70",
+        f"From: <sip:100@127.0.0.1>;tag={from_tag}",
+        f"To: <sip:100@127.0.0.1>;tag={to_tag}",
+        f"Call-ID: {call_id}",
+        f"CSeq: {cseq} NOTIFY",
+        "Contact: <sip:100@127.0.0.1:5061>",
+        "Event: dialog",
+        f"Event-ID: {event_id}",
+        "Subscription-State: active;expires=3600",
+        "Content-Type: application/blf+xml",
+        f"Content-Length: {len(body.encode())}",
+        "",
+        body,
+    ]
+    return "\r\n".join(lines)
 
 
 def main():
@@ -114,6 +171,40 @@ def main():
             elif first.startswith("ACK"):
                 print("[mock] Got ACK")
                 send_rtp_back()
+            elif first.startswith("SUBSCRIBE"):
+                lines = msg.split("\r\n")
+                headers = {}
+                for line in lines[1:]:
+                    if not line:
+                        break
+                    if ": " in line:
+                        key, value = line.split(": ", 1)
+                        headers[key] = value
+                sock.sendto(make_response(lines, 200, "OK").encode(), addr)
+                print("[mock] Got SUBSCRIBE, answered 200 OK")
+
+                # The Request-URI names the WATCHED resource (sip:101@default).
+                # The To header names the watcher. NOTIFY bodies must describe the
+                # watched resource, so the request line is the only correct source.
+                resource = first.split(" ")[1].replace("sip:", "").split(";")[0]
+                from_tag = headers.get("From", "").split("tag=")[-1].split(";")[0]
+                to_tag = "mockTAG"
+                event_id = headers.get("Event-ID", f"blf-{resource}")
+
+                def blf_thread(call_id=headers.get("Call-ID", ""),
+                               from_tag=from_tag,
+                               to_tag=to_tag,
+                               event_id=event_id,
+                               resource=resource):
+                    for index, (delay, rpid, caller) in enumerate(BLF_SCRIPT):
+                        time.sleep(delay)
+                        body = make_notify_body([(resource, rpid, caller)])
+                        notify = make_notify(call_id, from_tag, to_tag,
+                                             index + 1, event_id, body)
+                        sock.sendto(notify.encode(), addr)
+                        print(f"[mock] NOTIFY {resource} rpid={rpid}")
+
+                threading.Thread(target=blf_thread, daemon=True).start()
             elif first.startswith("BYE"):
                 r = make_response(msg.split("\r\n"), 200, "OK")
                 sock.sendto(r.encode(), addr)

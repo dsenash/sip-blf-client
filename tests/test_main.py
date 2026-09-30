@@ -123,6 +123,29 @@ class RenderTableTest(unittest.TestCase):
         button = BLFButton("101", "101", "default", "Operator 1")
         self.assertIn("-", render_blf_table(FakeManager([button])))
 
+    def test_shows_the_number_alone_when_there_is_no_name(self):
+        button = BLFButton("101", "101", "default", "Operator 1")
+        button.apply({"rpid": "ringing", "caller_id_number": "5551234"})
+        table = render_blf_table(FakeManager([button]))
+        self.assertIn("5551234", table)
+        self.assertNotIn("<>", table)
+
+    def test_shows_name_and_number_together(self):
+        button = BLFButton("101", "101", "default", "Operator 1")
+        button.apply({"rpid": "ringing", "caller_id_number": "5551234",
+                      "caller_id_name": "Alice"})
+        table = render_blf_table(FakeManager([button]))
+        self.assertIn("Alice <5551234>", table)
+
+    def test_lists_every_configured_button(self):
+        buttons = [BLFButton("101", "101", "default", "Operator 1"),
+                   BLFButton("102", "102", "default", "Manager")]
+        table = render_blf_table(FakeManager(buttons))
+        self.assertIn("101", table)
+        self.assertIn("102", table)
+        self.assertIn("Operator 1", table)
+        self.assertIn("Manager", table)
+
 
 class DispatchTest(unittest.TestCase):
     def test_press_dials_the_button_number(self):
