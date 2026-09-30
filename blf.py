@@ -93,10 +93,21 @@ class BLFButton:
         return True
 
 
+def _caller_text(button):
+    """Render the caller, omitting whichever half is absent."""
+    name = button.caller_name or ""
+    number = button.caller_number or ""
+    if name and number:
+        return f'caller="{name}" <{number}>'
+    if number:
+        return f"caller=<{number}>"
+    return f'caller="{name}"'
+
+
 def format_change(button):
     line = f"[BLF] {button.name} ({button.label}): {button.previous_state} -> {button.state}"
     if button.caller_name or button.caller_number:
-        line += f'  caller="{button.caller_name or ""}" <{button.caller_number or ""}>'
+        line += "  " + _caller_text(button)
     if button.uuid:
         line += f"  uuid={button.uuid}"
     return line

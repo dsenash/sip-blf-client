@@ -1,0 +1,27 @@
+{
+    "local_ip": "127.0.0.1",
+    "local_port": 5080,
+    "transport": "udp",
+    "target_user": "100",
+    "target_host": "127.0.0.1",
+    "target_port": 5061,
+    "wav_file": "test.wav",
+    "rtp_port": 10000,
+    "codec": "PCMU",
+    "sample_rate": 8000,
+    "call_duration": 5,
+    "user_agent": "PythonSIP/1.0",
+    "from_user": "100",
+    "display_name": "SIP Client",
+    "sip_call_timeout": 5,
+    "blf": {
+        "enabled": true,
+        "domain": "default",
+        "expires": 3600,
+        "refresh": 1800,
+        "buttons": [
+            {"name": "101", "number": "101", "label": "Operator 1"},
+            {"name": "102", "number": "102", "label": "Manager"}
+        ]
+    }
+}

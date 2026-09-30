@@ -1,0 +1,15 @@
+<!-- Install as conf/presence/blf.xml, then: fs_cli -x "reloadxml" -->
+<presence-group name="blf-watchers">
+  <presence id="101@default">
+    <rpid id="101@default" value="idle" status="active"/>
+    <rpid id="101@default" value="ringing" status="active"/>
+    <rpid id="101@default" value="busy" status="active"/>
+    <rpid id="101@default" value="held" status="active"/>
+  </presence>
+  <presence id="102@default">
+    <rpid id="102@default" value="idle" status="active"/>
+    <rpid id="102@default" value="ringing" status="active"/>
+    <rpid id="102@default" value="busy" status="active"/>
+    <rpid id="102@default" value="held" status="active"/>
+  </presence>
+</presence-group>

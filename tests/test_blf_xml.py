@@ -161,7 +161,16 @@ class FormatChangeTest(unittest.TestCase):
     def test_tolerates_a_missing_caller_name(self):
         b = button()
         b.apply({"rpid": "ringing", "caller_id_number": "5551234"})
-        self.assertIn('caller="" <5551234>', format_change(b))
+        line = format_change(b)
+        self.assertIn("caller=<5551234>", line)
+        self.assertNotIn('""', line)
+
+    def test_tolerates_a_missing_caller_number(self):
+        b = button()
+        b.apply({"rpid": "ringing", "caller_id_name": "Ann"})
+        line = format_change(b)
+        self.assertIn('caller="Ann"', line)
+        self.assertNotIn("<>", line)
 
     def test_omits_caller_entirely_when_absent(self):
         b = button()

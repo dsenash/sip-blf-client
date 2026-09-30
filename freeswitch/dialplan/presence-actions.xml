@@ -1,0 +1,31 @@
+<!--
+Merge these actions into the extension that each watched user dials.
+The variable ${uuid} is the current channel.
+
+The <presence> application below is an ALTERNATIVE to the uuid_setvar pair.
+Its argument order is NOT verified by this project. Before using it, check
+your own build:
+
+    fs_cli
+    show application presence
+
+Then keep whichever form that output matches, and delete the other.
+-->
+<extension name="blf-presence">
+  <condition field="${sip_gateway_name}" expression="^$">
+    <!-- Outbound leg of a call to a watched user: this channel is the one
+         a BLF watcher wants to see as busy. -->
+    <action application="set" data="presence_id=${dialed_user}@${domain}"/>
+    <action application="uuid_setvar" data="${dialed_user}@${domain} presence_id"/>
+    <action application="log" data="INFO BLF presence: set idle on ${dialed_user}@${domain}"/>
+  </condition>
+</extension>
+
+<!-- Ring state, on the alerting channel. -->
+<action application="uuid_setvar" data="${presence_id} rpid ringing"/>
+
+<!-- Handed-up state, after answer. -->
+<action application="uuid_setvar" data="${presence_id} rpid busy"/>
+
+<!-- Back to idle, in the hangup handler or after the bridge ends. -->
+<action application="uuid_setvar" data="${presence_id} rpid idle"/>
