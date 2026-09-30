@@ -35,25 +35,31 @@ class FakeDialog:
         self.subscribes = []
         self.refreshes = []
         self.unsubscribes = []
+        self.to_tag = None
 
     def send_subscribe(self, event, accept, expires, event_id):
         self.subscribes.append((event, accept, expires, event_id))
 
     def send_refresh(self, expires):
-        self.refreshes.append(expires)
+        self.refreshes.append((expires, self.to_tag))
 
     def send_unsubscribe(self):
-        self.unsubscribes.append(True)
+        self.unsubscribes.append(self.to_tag)
 
 
 class FakeClient:
     def __init__(self):
         self.dialogs = []
+        self.sent = []
 
     def create_dialog(self, target_uri):
         dialog = FakeDialog(target_uri)
         self.dialogs.append(dialog)
         return dialog
+
+    def send(self, data):
+        self.sent.append(data)
+        return len(data)
 
 
 class FakeMessage:
@@ -124,7 +130,7 @@ class SubscribeTest(unittest.TestCase):
         client, manager, log = make_manager(refresh=1800, expires=3600)
         manager.subscribe_all()
         manager.subscribe_all()
-        self.assertEqual(client.dialogs[0].refreshes, [3600])
+        self.assertEqual(client.dialogs[0].refreshes, [(3600, None)])
 
     def test_refresh_due_refreshes_only_expired_buttons(self):
         client, manager, log = make_manager(refresh=1800, expires=3600)
@@ -324,3 +330,106 @@ class SubscribeResponseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NotifyResponseTest(unittest.TestCase):
+    """A notifier retransmits until it gets a 2xx, so every NOTIFY is answered."""
+
+    def notify_message(self, body="<event/>",
+                       headers=None):
+        base = {"Content-Type": "application/blf+xml",
+                "Call-ID": "watcher-call",
+                "CSeq": "3 NOTIFY",
+                "Via": "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1",
+                "From": "<sip:101@default>;tag=servertag",
+                "To": "<sip:100@127.0.0.1>;tag=watchertag"}
+        base.update(headers or {})
+        return FakeMessage("NOTIFY", body=body, headers=base)
+
+    def test_notify_is_answered_with_200_ok(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(self.notify_message())
+        self.assertEqual(len(client.sent), 1)
+        self.assertIn(b"SIP/2.0 200 OK", client.sent[0])
+
+    def test_response_echoes_the_dialog_headers(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(self.notify_message())
+        sent = client.sent[0]
+        self.assertIn(b"Call-ID: watcher-call", sent)
+        self.assertIn(b"CSeq: 3 NOTIFY", sent)
+        self.assertIn(b"tag=servertag", sent)
+        self.assertIn(b"tag=watchertag", sent)
+        self.assertIn(b"branch=z9hG4bK1", sent)
+
+    def test_unparseable_body_is_still_answered(self):
+        # Nothing to update, but staying silent would make the notifier
+        # retransmit the same broken body until the subscription expires.
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(self.notify_message(body="not xml at all"))
+        self.assertIn(b"SIP/2.0 200 OK", client.sent[0])
+
+    def test_unexpected_content_type_is_still_answered(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(self.notify_message(
+            headers={"Content-Type": "application/simple-message-summary"}))
+        self.assertIn(b"SIP/2.0 200 OK", client.sent[0])
+
+    def test_each_notify_is_answered_once(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        for _ in range(3):
+            manager.handle_notify(self.notify_message())
+        self.assertEqual(len(client.sent), 3)
+
+    def test_a_non_notify_is_not_answered(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(FakeMessage("INVITE"))
+        self.assertEqual(client.sent, [])
+
+
+class SubscriptionDialogTagTest(unittest.TestCase):
+    """A refresh or unsubscribe without a To tag is a new dialog, not a refresh."""
+
+    def accepted(self, manager, name="101", to_tag="serverTAG"):
+        call_id = None
+        for dialog_name, dialog in manager._dialogs.items():
+            if dialog_name == name:
+                call_id = dialog.call_id
+        manager.handle_response(Response(
+            200, "OK", headers={"Call-ID": call_id,
+                               "To": f"<sip:101@default>;tag={to_tag}"}))
+
+    def test_accepted_subscribe_records_the_to_tag(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        self.accepted(manager)
+        self.assertEqual(manager._dialogs["101"].to_tag, "serverTAG")
+
+    def test_refresh_carries_the_to_tag(self):
+        client, manager, log = make_manager(refresh=0)
+        manager.subscribe_all()
+        self.accepted(manager)
+        manager._next_refresh["101"] = time.time() - 1
+        manager.refresh_due()
+        self.assertEqual(client.dialogs[0].refreshes, [(3600, "serverTAG")])
+
+    def test_unsubscribe_carries_the_to_tag(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        self.accepted(manager)
+        manager.unsubscribe_all()
+        self.assertEqual(client.dialogs[0].unsubscribes, ["serverTAG"])
+
+    def test_response_without_a_tag_leaves_it_unset(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        call_id = manager._dialogs["101"].call_id
+        manager.handle_response(Response(
+            200, "OK", headers={"Call-ID": call_id,
+                               "To": "<sip:101@default>"}))
+        self.assertIsNone(manager._dialogs["101"].to_tag)

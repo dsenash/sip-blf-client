@@ -5,13 +5,65 @@ import time
 import uuid
 
 
+class SIPHeaders(dict):
+    """A dict of SIP headers.
+
+    Header names are case-insensitive per RFC 3261, so a lookup must not
+    depend on how the peer cased it: FreeSWITCH sends "Content-Type" while
+    other stacks send "content-type", and a case-sensitive miss silently
+    dropped NOTIFY bodies. The original casing is kept as the real key so
+    that build() still writes headers the way the caller spelled them.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._spelling = {}
+        self.update(dict(*args, **kwargs))
+
+    def _actual(self, key):
+        return self._spelling.get(key.lower(), key)
+
+    def __setitem__(self, key, value):
+        if not isinstance(key, str):
+            super().__setitem__(key, value)
+            return
+        self._spelling.setdefault(key.lower(), key)
+        super().__setitem__(self._spelling[key.lower()], value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._actual(key))
+
+    def __delitem__(self, key):
+        super().__delitem__(self._actual(key))
+        if isinstance(key, str):
+            self._spelling.pop(key.lower(), None)
+
+    def __contains__(self, key):
+        return super().__contains__(self._actual(key))
+
+    def get(self, key, default=None):
+        return super().get(self._actual(key), default)
+
+    def pop(self, key, *args):
+        return super().pop(self._actual(key), *args)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, other=(), **kwargs):
+        for name, value in dict(other, **kwargs).items():
+            self[name] = value
+
+
 class SIPMessage:
     def __init__(self, method=None, uri=None, status_code=None, reason=None):
         self.method = method
         self.uri = uri
         self.status_code = status_code
         self.reason = reason
-        self.headers = {}
+        self.headers = SIPHeaders()
         self.body = ""
 
     def add_header(self, name, value):
@@ -45,7 +97,7 @@ class SIPMessage:
             data = data.decode("utf-8", errors="replace")
 
         lines = data.split("\r\n")
-        if not lines:
+        if not lines or not lines[0].strip():
             return None
 
         msg = cls()
@@ -53,14 +105,21 @@ class SIPMessage:
 
         if first_line.startswith("SIP/2.0"):
             parts = first_line.split(" ", 2)
-            if len(parts) >= 3:
+            if len(parts) < 3:
+                return None
+            try:
                 msg.status_code = int(parts[1])
-                msg.reason = parts[2]
+            except ValueError:
+                # A junk datagram must not take down a client that is holding
+                # live subscriptions and a console open.
+                return None
+            msg.reason = parts[2]
         else:
             parts = first_line.split(" ", 2)
-            if len(parts) >= 2:
-                msg.method = parts[0]
-                msg.uri = parts[1]
+            if len(parts) < 2:
+                return None
+            msg.method = parts[0]
+            msg.uri = parts[1]
 
         i = 1
         while i < len(lines):
@@ -68,9 +127,10 @@ class SIPMessage:
             if not line:
                 i += 1
                 break
-            if ": " in line:
-                name, value = line.split(": ", 1)
-                msg.headers[name] = value
+            # HCOLON does not require the space, and real servers omit it.
+            if ":" in line:
+                name, value = line.split(":", 1)
+                msg.headers[name.strip()] = value.strip()
             i += 1
 
         msg.body = "\r\n".join(lines[i:]) if i < len(lines) else ""

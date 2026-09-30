@@ -1,6 +1,8 @@
 import time
 from xml.etree import ElementTree
 
+from call_session import send_simple_response
+
 KNOWN_STATES = ("idle", "ringing", "busy", "held")
 
 
@@ -231,6 +233,11 @@ class BLFManager:
         """Update button state from a NOTIFY. Returns the buttons that changed."""
         if msg.method != "NOTIFY":
             return []
+        # Answer before looking at the body. A notifier retransmits with
+        # doubling intervals until it gets a 2xx, so an unanswered NOTIFY
+        # arrives roughly seven times over half a minute and the watcher reads
+        # as dead. That includes a body we cannot use: silence is not an answer.
+        send_simple_response(self.client, msg, 200, "OK")
         if "blf+xml" not in msg.headers.get("Content-Type", ""):
             return []
 
@@ -269,6 +276,12 @@ class BLFManager:
                 continue
             code = msg.status_code
             if 200 <= code < 300:
+                # The To tag identifies the dialog. Without it, refresh and
+                # unsubscribe create a new dialog rather than continuing this one.
+                to_tag = None
+                if "tag=" in msg.headers.get("To", ""):
+                    to_tag = msg.headers.get("To", "").split(";tag=")[1].split(";")[0]
+                dialog.to_tag = to_tag
                 self.log(f"[BLF] SUBSCRIBE {name} accepted ({code} {msg.reason})")
             else:
                 self.log(f"[!] BLF SUBSCRIBE {name} rejected: {code} {msg.reason}")
