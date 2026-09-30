@@ -146,10 +146,11 @@ def main():
     client.local_ip = local_ip
     client.local_port = config.get("local_port", 5080)
     client.transport = protocol
-    client.remote_addr = (target["host"], target["port"])
+    client.open((target["host"], target["port"]))
+    dialog = client.create_dialog(uri)
 
     print(f"[-] Sending INVITE to {uri}")
-    client.send_invite(uri)
+    dialog.send_invite()
 
     connected = False
     to_tag = None
@@ -181,7 +182,7 @@ def main():
             if "To" in msg.headers and ";tag=" in msg.headers["To"]:
                 to_tag = msg.headers["To"].split(";tag=")[1].split(";")[0]
             client.last_sdp = msg.body
-            client.send_ack(uri, to_tag)
+            dialog.send_ack(to_tag)
             print("[+] ACK sent")
             handle_call(client, config, rtp_port, wav_file, call_duration, uri, to_tag)
             connected = True
@@ -210,7 +211,7 @@ def main():
             print("\n[*] Interrupted")
         finally:
             print("[*] Sending BYE")
-            client.send_bye(uri, to_tag)
+            dialog.send_bye(to_tag)
             time.sleep(1)
             if getattr(client, "monitor", None):
                 client.monitor.stop()

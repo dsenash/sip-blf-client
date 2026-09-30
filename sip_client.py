@@ -1,8 +1,7 @@
 import socket
-import struct
 import random
+import threading
 import time
-import hashlib
 import uuid
 
 
@@ -74,6 +73,97 @@ class SIPMessage:
         return msg
 
 
+class SIPDialog:
+    """One SIP dialog: its own Call-ID, CSeq sequence and From tag.
+
+    A client can hold several at once, which is what lets a BLF subscription
+    share a socket with a live call.
+    """
+
+    def __init__(self, client, target_uri):
+        self.client = client
+        self.target_uri = target_uri
+        self.call_id = str(uuid.uuid4())
+        self.cseq = 1
+        self.from_tag = "".join(random.choices("0123456789", k=8))
+        self.to_tag = None
+        self.event = None
+        self.accept = None
+        self.event_id = None
+
+    def _next_cseq(self):
+        value = self.cseq
+        self.cseq += 1
+        return value
+
+    def _next_branch(self):
+        return "z9hG4bK" + "".join(random.choices("0123456789abcdef", k=16))
+
+    def _to_header(self, to_tag=None):
+        header = f"<{self.target_uri}>"
+        if to_tag:
+            header += f";tag={to_tag}"
+        return header
+
+    def _build(self, method, cseq, to_tag=None, extra=None, body=None):
+        client = self.client
+        msg = SIPMessage(method, self.target_uri)
+        msg.add_header(
+            "Via",
+            f"SIP/2.0/{client.transport.upper()} {client.local_ip}:{client.local_port}"
+            f";branch={self._next_branch()};rport",
+        )
+        msg.add_header("Max-Forwards", "70")
+        msg.add_header(
+            "From",
+            f'"{client.display_name}" <sip:{client.from_user}@{client.local_ip}'
+            f':{client.local_port}>;tag={self.from_tag}',
+        )
+        msg.add_header("To", self._to_header(to_tag))
+        msg.add_header("Call-ID", self.call_id)
+        msg.add_header("CSeq", f"{cseq} {method}")
+        msg.add_header(
+            "Contact",
+            f"<sip:{client.from_user}@{client.local_ip}:{client.local_port}"
+            f";transport={client.transport}>",
+        )
+        msg.add_header("User-Agent", client.user_agent)
+        for name, value in extra or []:
+            msg.add_header(name, value)
+        if body:
+            msg.add_header("Content-Type", "application/sdp")
+            msg.body = body
+        # Content-Length is a real header, not just a build() artifact, so that
+        # callers and tests can read it back off the message.
+        msg.add_header("Content-Length", str(len((body or "").encode())))
+        return msg
+
+    def build_invite(self):
+        return self._build(
+            "INVITE",
+            self._next_cseq(),
+            extra=[("Accept", "application/sdp, application/dtmf-relay")],
+            body=self.client.build_sdp(),
+        )
+
+    def build_ack(self, to_tag=None):
+        # An ACK repeats the INVITE's CSeq, which is one behind the counter
+        # now that _next_cseq has advanced.
+        return self._build("ACK", self.cseq - 1, to_tag=to_tag)
+
+    def build_bye(self, to_tag=None):
+        return self._build("BYE", self._next_cseq(), to_tag=to_tag)
+
+    def send_invite(self):
+        return self.client.send(self.build_invite().build().encode())
+
+    def send_ack(self, to_tag=None):
+        return self.client.send(self.build_ack(to_tag).build().encode())
+
+    def send_bye(self, to_tag=None):
+        return self.client.send(self.build_bye(to_tag).build().encode())
+
+
 class SIPClient:
     def __init__(self, config):
         self.config = config
@@ -83,41 +173,31 @@ class SIPClient:
         self.from_user = config.get("from_user", "100")
         self.display_name = config.get("display_name", "SIP Client")
         self.user_agent = config.get("user_agent", "PythonSIP/1.0")
-        self.call_id = str(uuid.uuid4())
-        self.cseq = 1
-        self.branch = "z9hG4bK" + "".join(random.choices("0123456789abcdef", k=16))
-        self.tag = "".join(random.choices("0123456789", k=8))
         self.rtp_port = config.get("rtp_port", 10000)
         self.socket = None
         self.remote_addr = None
-        self.remote_rtp_port = None
-        self.remote_rtp_addr = None
-        self.connected = False
-        self.running = True
         self.last_sdp = ""
+        self._send_lock = threading.Lock()
 
-    def _create_socket(self):
+    def open(self, remote_addr):
+        self.remote_addr = remote_addr
         if self.transport == "tcp":
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.connect(self.remote_addr)
+            self.socket.connect(remote_addr)
         else:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.local_ip, self.local_port))
+        return self
 
-    def _next_cseq(self):
-        val = self.cseq
-        self.cseq += 1
-        return val
+    def create_dialog(self, target_uri):
+        return SIPDialog(self, target_uri)
 
-    def _next_branch(self):
-        self.branch = "z9hG4bK" + "".join(random.choices("0123456789abcdef", k=16))
-        return self.branch
-
-    def _build_sdp(self):
+    def build_sdp(self):
+        now = int(time.time())
         sdp = "v=0\r\n"
-        sdp += f"o={self.from_user} {int(time.time())} {int(time.time())} IN IP4 {self.local_ip}\r\n"
+        sdp += f"o={self.from_user} {now} {now} IN IP4 {self.local_ip}\r\n"
         sdp += "s=SIP Client\r\n"
         sdp += f"c=IN IP4 {self.local_ip}\r\n"
         sdp += "t=0 0\r\n"
@@ -130,109 +210,40 @@ class SIPClient:
         sdp += "a=sendonly\r\n"
         return sdp
 
-    def send_invite(self, target_uri):
-        self.remote_addr = self._parse_uri(target_uri)
-        self._create_socket()
+    def send(self, data):
+        if self.socket is None:
+            raise RuntimeError("SIP socket is not open, call open() first")
+        with self._send_lock:
+            if self.transport == "tcp":
+                self.socket.send(data)
+            else:
+                self.socket.sendto(data, self.remote_addr)
 
-        msg = SIPMessage("INVITE", target_uri)
-        msg.add_header("Via", f"SIP/2.0/{self.transport.upper()} {self.local_ip}:{self.local_port};branch={self._next_branch()};rport")
-        msg.add_header("Max-Forwards", "70")
-        msg.add_header("From", f'"{self.display_name}" <sip:{self.from_user}@{self.local_ip}:{self.local_port}>;tag={self.tag}')
-        msg.add_header("To", f"<{target_uri}>")
-        msg.add_header("Call-ID", self.call_id)
-        msg.add_header("CSeq", f"{self._next_cseq()} INVITE")
-        msg.add_header("Contact", f"<sip:{self.from_user}@{self.local_ip}:{self.local_port};transport={self.transport}>")
-        msg.add_header("User-Agent", self.user_agent)
-        msg.add_header("Content-Type", "application/sdp")
-        msg.add_header("Accept", "application/sdp, application/dtmf-relay")
-        msg.body = self._build_sdp()
+    @staticmethod
+    def _is_sdp(msg):
+        ctype = msg.headers.get("Content-Type", "")
+        return ctype.split(";")[0].strip().lower() == "application/sdp"
 
-        self._send(msg.build().encode())
-        return msg
-
-    def send_ack(self, uri, to_tag=None):
-        msg = SIPMessage("ACK", uri)
-        msg.add_header("Via", f"SIP/2.0/{self.transport.upper()} {self.local_ip}:{self.local_port};branch={self._next_branch()};rport")
-        msg.add_header("Max-Forwards", "70")
-        msg.add_header("From", f'"{self.display_name}" <sip:{self.from_user}@{self.local_ip}:{self.local_port}>;tag={self.tag}')
-        to_hdr = f"<{uri}>"
-        if to_tag:
-            to_hdr += f";tag={to_tag}"
-        msg.add_header("To", to_hdr)
-        msg.add_header("Call-ID", self.call_id)
-        msg.add_header("CSeq", f"{self.cseq - 1} ACK")
-
-        self._send(msg.build().encode())
-        return msg
-
-    def send_bye(self, uri, to_tag=None):
-        msg = SIPMessage("BYE", uri)
-        msg.add_header("Via", f"SIP/2.0/{self.transport.upper()} {self.local_ip}:{self.local_port};branch={self._next_branch()};rport")
-        msg.add_header("Max-Forwards", "70")
-        msg.add_header("From", f'"{self.display_name}" <sip:{self.from_user}@{self.local_ip}:{self.local_port}>;tag={self.tag}')
-        to_hdr = f"<{uri}>"
-        if to_tag:
-            to_hdr += f";tag={to_tag}"
-        msg.add_header("To", to_hdr)
-        msg.add_header("Call-ID", self.call_id)
-        msg.add_header("CSeq", f"{self._next_cseq()} BYE")
-
-        self._send(msg.build().encode())
-        return msg
-
-    def _send(self, data):
-        if self.transport == "tcp":
-            self.socket.send(data)
-        else:
-            self.socket.sendto(data, self.remote_addr)
-
-    def receive(self, timeout=5, tcp_stream_data=b""):
+    def receive(self, timeout=5):
         self.socket.settimeout(timeout)
         try:
             if self.transport == "tcp":
-                buf = tcp_stream_data or b""
+                buf = b""
                 while b"\r\n\r\n" not in buf:
                     chunk = self.socket.recv(65535)
                     if not chunk:
                         return None
                     buf += chunk
-                if buf:
-                    msg = SIPMessage.parse(buf)
-                    if msg and msg.body:
-                        self.last_sdp = msg.body
-                    return msg
-                return None
+                data = buf
             else:
-                data, addr = self.socket.recvfrom(65535)
+                data, _ = self.socket.recvfrom(65535)
         except socket.timeout:
             return None
         msg = SIPMessage.parse(data)
-        if msg and msg.body:
+        # Only SDP counts as media state. A NOTIFY body must never clobber it.
+        if msg and msg.body and self._is_sdp(msg):
             self.last_sdp = msg.body
         return msg
-
-    def _parse_uri(self, uri):
-        uri = uri.replace("sip:", "")
-        transport = "udp"
-        if ";transport=" in uri:
-            uri, tparam = uri.rsplit(";", 1)
-            if tparam.startswith("transport="):
-                transport = tparam.split("=", 1)[1].lower()
-            self.transport = transport
-
-        if "@" in uri:
-            host_port = uri.split("@", 1)[1]
-        else:
-            host_port = uri
-
-        if ":" in host_port:
-            host, port = host_port.rsplit(":", 1)
-            port = int(port)
-        else:
-            host = host_port
-            port = 5060
-
-        return (host, port)
 
     def parse_sdp(self, sdp_body):
         result = {"media_port": None, "media_ip": None, "codecs": []}
