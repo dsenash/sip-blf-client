@@ -1,0 +1,16 @@
+{
+    "local_ip": "0.0.0.0",
+    "local_port": 5080,
+    "transport": "udp",
+    "target_user": "101",
+    "target_host": "192.168.0.89",
+    "target_port": 5060,
+    "wav_file": "piano2.wav",
+    "rtp_port": 10000,
+    "codec": "PCMU",
+    "sample_rate": 8000,
+    "call_duration": 30,
+    "user_agent": "PythonSIP/1.0",
+    "from_user": "100",
+    "display_name": "SIP Client"
+}
