@@ -100,3 +100,40 @@ def format_change(button):
     if button.uuid:
         line += f"  uuid={button.uuid}"
     return line
+
+
+def load_buttons(config, log=print):
+    """Build the button list from the config's blf section, dropping bad entries."""
+    section = config.get("blf") or {}
+    domain = section.get("domain", "default")
+    buttons = []
+    seen = set()
+
+    for index, raw in enumerate(section.get("buttons") or []):
+        if not isinstance(raw, dict):
+            log(f"[!] blf.buttons[{index}] is not an object, skipped")
+            continue
+        name = raw.get("name")
+        if not name:
+            log(f"[!] blf.buttons[{index}] has no 'name', skipped")
+            continue
+        if name in seen:
+            log(f"[!] blf.buttons[{index}] duplicate name '{name}', skipped")
+            continue
+        seen.add(name)
+        buttons.append(
+            BLFButton(name, raw.get("number") or name, domain, raw.get("label")))
+
+    return buttons
+
+
+def resolve_timing(config, log=print):
+    """Return (expires, refresh), clamping refresh so it always precedes expiry."""
+    section = config.get("blf") or {}
+    expires = int(section.get("expires", 3600))
+    refresh = int(section.get("refresh", 1800))
+    if refresh >= expires:
+        clamped = max(1, expires // 2)
+        log(f"[!] blf.refresh ({refresh}) >= blf.expires ({expires}), using {clamped}")
+        refresh = clamped
+    return expires, refresh
