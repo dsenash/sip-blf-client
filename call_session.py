@@ -124,6 +124,11 @@ class CallSession:
         return True
 
     def on_message(self, msg):
+        # The session object is reused for the next call, so a late answer or
+        # a stray BYE from an earlier dialog would otherwise be applied to the
+        # live call: adopting its To tag, its SDP, or ending the call outright.
+        if not self._belongs_to_this_dialog(msg):
+            return False
         if msg.method == "BYE":
             self.log("[*] Received BYE, sending 200 OK")
             send_simple_response(self.client, msg, 200, "OK")
@@ -139,6 +144,16 @@ class CallSession:
         if msg.status_code is None or self.state != self.CALLING:
             return False
         return self._on_response(msg)
+
+    def _belongs_to_this_dialog(self, msg):
+        if self.dialog is None:
+            return False
+        call_id = msg.headers.get("Call-ID", "")
+        if not call_id:
+            # Nothing to match against, so do not guess: a bare datagram is not
+            # evidence about this dialog.
+            return False
+        return call_id == self.dialog.call_id
 
     def _on_response(self, msg):
         code = msg.status_code
@@ -193,7 +208,9 @@ class CallSession:
         # time, and a strict comparison would depend on clock granularity.
         if self.state == self.CALLING and time.time() >= self._deadline:
             self.log("[!] Timeout waiting for SIP response")
-            self._finish()
+            # hangup(), not _finish(): the INVITE is still outstanding, so it
+            # has to be cancelled rather than just forgotten.
+            self.hangup()
 
     def hangup(self):
         if self.state == self.IDLE:
@@ -201,6 +218,12 @@ class CallSession:
         if self.state == self.ACTIVE:
             self.log("[*] Sending BYE")
             self.dialog.send_bye(self.to_tag)
+        elif self.state == self.CALLING:
+            # Nothing was established yet, so there is no BYE to send: a BYE
+            # on an unanswered INVITE is a protocol error. CANCEL is what
+            # stops the far end from ringing on with nobody there.
+            self.log("[*] Cancelling the unanswered INVITE")
+            self.dialog.send_cancel()
         self._finish()
 
     def _finish(self):

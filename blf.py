@@ -94,6 +94,15 @@ class BLFButton:
         self.changed_at = time.time()
         return True
 
+    def reset(self):
+        """Forget the last known state, as when the subscription is dropped."""
+        self.previous_state = self.state
+        self.state = "unknown"
+        self.caller_name = None
+        self.caller_number = None
+        self.uuid = None
+        self.changed_at = time.time()
+
 
 def _caller_text(button):
     """Render the caller, omitting whichever half is absent."""
@@ -140,11 +149,30 @@ def load_buttons(config, log=print):
     return buttons
 
 
+def _as_int(value, default, key, log):
+    """Read a timing value, falling back on anything unusable.
+
+    A typo in the config should cost a warning, not the whole client: this is
+    called from build_blf_manager with no handler around it.
+    """
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        log(f"[!] blf.{key} ({value!r}) is not a number, using {default}")
+        return default
+    if parsed <= 0:
+        log(f"[!] blf.{key} ({parsed}) must be positive, using {default}")
+        return default
+    return parsed
+
+
 def resolve_timing(config, log=print):
     """Return (expires, refresh), clamping refresh so it always precedes expiry."""
     section = config.get("blf") or {}
-    expires = int(section.get("expires", 3600))
-    refresh = int(section.get("refresh", 1800))
+    expires = _as_int(section.get("expires", 3600), 3600, "expires", log)
+    refresh = _as_int(section.get("refresh", 1800), 1800, "refresh", log)
     if refresh >= expires:
         clamped = max(1, expires // 2)
         log(f"[!] blf.refresh ({refresh}) >= blf.expires ({expires}), using {clamped}")
@@ -193,6 +221,15 @@ class BLFManager:
 
     def _subscribe(self, button):
         dialog = self._dialogs.get(button.name)
+        if dialog is not None and dialog.to_tag is None:
+            # The initial SUBSCRIBE is still unanswered, so this is a
+            # retransmission of the same request rather than a refresh: keep
+            # the dialog and its To tag state, and resend unchanged.
+            dialog.send_subscribe("dialog", "application/blf+xml", self.expires,
+                                  f"blf-{button.name}@{button.domain}")
+            self.log(f"[BLF] RESEND SUBSCRIBE {button.name} "
+                     f"-> {button.subscribe_uri}")
+            return
         if dialog is None:
             dialog = self.client.create_dialog(button.subscribe_uri)
             self._dialogs[button.name] = dialog
@@ -238,6 +275,8 @@ class BLFManager:
         # arrives roughly seven times over half a minute and the watcher reads
         # as dead. That includes a body we cannot use: silence is not an answer.
         send_simple_response(self.client, msg, 200, "OK")
+        if self._subscription_ended(msg):
+            return []
         if "blf+xml" not in msg.headers.get("Content-Type", ""):
             return []
 
@@ -259,6 +298,40 @@ class BLFManager:
         for button in changed:
             self.log(format_change(button))
         return changed
+
+    def _subscription_ended(self, msg):
+        """Handle Subscription-State: terminated.
+
+        A subscription the server has dropped must not leave the button
+        showing its last state forever. Re-subscribe on a fresh dialog: the
+        old one is dead, so a refresh on it would only draw another rejection.
+        """
+        state = msg.headers.get("Subscription-State", "")
+        if not state.lower().startswith("terminated"):
+            return False
+        resource = None
+        if msg.body:
+            try:
+                instances = parse_blf_xml(msg.body)
+            except BLFParseError:
+                instances = {}
+            if instances:
+                resource = next(iter(instances))
+        button = self._find_by_resource(resource) if resource else None
+        name = button.name if button is not None else resource
+        self.log(f"[!] BLF subscription for {name} {state}")
+
+        if button is not None:
+            button.reset()
+            self.log(format_change(button))
+        button = self.get(name) if name is not None else None
+        self._dialogs.pop(name, None)
+        self._next_refresh.pop(name, None)
+        if button is not None:
+            # With the dialog dropped, _subscribe builds a fresh one, which is
+            # what a new subscription needs.
+            self._subscribe(button)
+        return True
 
     def handle_response(self, msg):
         """Route a subscription response.

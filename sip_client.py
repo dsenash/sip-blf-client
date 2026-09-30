@@ -151,6 +151,7 @@ class SIPDialog:
         self.cseq = 1
         self.from_tag = "".join(random.choices("0123456789", k=8))
         self.to_tag = None
+        self.invite_branch = None
         self.event = None
         self.accept = None
         self.event_id = None
@@ -169,13 +170,15 @@ class SIPDialog:
             header += f";tag={to_tag}"
         return header
 
-    def _build(self, method, cseq, to_tag=None, extra=None, body=None):
+    def _build(self, method, cseq, to_tag=None, extra=None, body=None,
+               branch=None):
         client = self.client
         msg = SIPMessage(method, self.target_uri)
+        branch = branch or self._next_branch()
         msg.add_header(
             "Via",
             f"SIP/2.0/{client.transport.upper()} {client.local_ip}:{client.local_port}"
-            f";branch={self._next_branch()};rport",
+            f";branch={branch};rport",
         )
         msg.add_header("Max-Forwards", "70")
         msg.add_header(
@@ -203,12 +206,28 @@ class SIPDialog:
         return msg
 
     def build_invite(self):
-        return self._build(
+        msg = self._build(
             "INVITE",
             self._next_cseq(),
             extra=[("Accept", "application/sdp, application/dtmf-relay")],
             body=self.client.build_sdp(),
         )
+        self.invite_branch = msg.headers["Via"].split("branch=")[1].split(";")[0]
+        return msg
+
+    def build_cancel(self):
+        # A CANCEL is matched to the request it cancels by the Via branch, so
+        # it has to repeat the INVITE's branch rather than mint a new one.
+        # RFC 3261 9.1: a CANCEL with a fresh branch is a request in its own
+        # right and the transaction is left dangling.
+        return self._build(
+            "CANCEL",
+            self._next_cseq(),
+            branch=self.invite_branch,
+        )
+
+    def send_cancel(self):
+        return self.client.send(self.build_cancel().build().encode())
 
     def build_ack(self, to_tag=None):
         # An ACK repeats the INVITE's CSeq, which is one behind the counter

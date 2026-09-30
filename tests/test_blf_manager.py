@@ -116,25 +116,44 @@ class SubscribeTest(unittest.TestCase):
         self.assertIn("sip:101@default", log)
         self.assertIn("SUBSCRIBE 102", log)
 
+    def accepted(self, manager, name="101"):
+        call_id = manager._dialogs[name].call_id
+        manager.handle_response(Response(
+            200, "OK", headers={"Call-ID": call_id,
+                               "To": "<sip:101@default>;tag=serverTAG"}))
+
     def test_resubscribing_reuses_the_same_dialog(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        self.accepted(manager)
+        manager.subscribe_all()
+        self.assertEqual(len(client.dialogs), 2)
+        self.assertEqual(len(client.dialogs[0].subscribes), 1)
+        self.assertEqual(len(client.dialogs[0].refreshes), 1)
+
+    def test_resubscribe_before_the_answer_resends_rather_than_refreshes(self):
+        # Until the 2xx arrives there is no To tag, so a re-SUBSCRIBE is a
+        # retransmission of the same request, not a new dialog to extend.
         client, manager, log = make_manager()
         manager.subscribe_all()
         manager.subscribe_all()
         self.assertEqual(len(client.dialogs), 2)
-        self.assertEqual(client.dialogs[0].subscribes.__len__(), 1)
-        self.assertEqual(len(client.dialogs[0].refreshes), 1)
+        self.assertEqual(len(client.dialogs[0].subscribes), 2)
+        self.assertEqual(client.dialogs[0].refreshes, [])
 
     def test_refresh_reuses_the_original_expires(self):
         # A re-SUBSCRIBE re-sends the original Expires. blf.refresh only
         # decides WHEN the client re-subscribes; it is never the Expires value.
         client, manager, log = make_manager(refresh=1800, expires=3600)
         manager.subscribe_all()
+        self.accepted(manager)
         manager.subscribe_all()
-        self.assertEqual(client.dialogs[0].refreshes, [(3600, None)])
+        self.assertEqual(client.dialogs[0].refreshes, [(3600, "serverTAG")])
 
     def test_refresh_due_refreshes_only_expired_buttons(self):
         client, manager, log = make_manager(refresh=1800, expires=3600)
         manager.subscribe_all()
+        self.accepted(manager)
         manager._next_refresh["101"] = time.time() - 1
         manager.refresh_due()
         self.assertEqual(len(client.dialogs[0].refreshes), 1)
@@ -433,3 +452,55 @@ class SubscriptionDialogTagTest(unittest.TestCase):
             200, "OK", headers={"Call-ID": call_id,
                                "To": "<sip:101@default>"}))
         self.assertIsNone(manager._dialogs["101"].to_tag)
+
+
+class TerminatedSubscriptionTest(unittest.TestCase):
+    """Subscription-State is how the server says the subscription is over.
+
+    Ignoring it left the button frozen on its last state with no log, and the
+    recovery SUBSCRIBE went out on the dead dialog, so the server rejected it
+    on every refresh tick forever.
+    """
+
+    def notify(self, state, reason=None):
+        value = state if reason is None else f"{state};reason={reason}"
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<event name="dialog" xmlns="urn:freedeswitch:blf">'
+                '<instance name="101@default"><params>'
+                '<param name="rpid" value="ringing"/>'
+                "</params></instance></event>")
+        return FakeMessage("NOTIFY", body=body, headers={
+            "Content-Type": "application/blf+xml",
+            "Subscription-State": value,
+            "Call-ID": "watcher",
+            "CSeq": "4 NOTIFY",
+            "Via": "v", "From": "f", "To": "t"})
+
+    def setUp(self):
+        self.client, self.manager, self.log = make_manager()
+        self.manager.subscribe_all()
+        self.manager.handle_notify(FakeMessage(
+            "NOTIFY",
+            body='<?xml version="1.0"?><event name="dialog" '
+                 'xmlns="urn:freedeswitch:blf"><instance name="101@default">'
+                 '<params><param name="rpid" value="ringing"/></params>'
+                 "</instance></event>",
+            headers={"Content-Type": "application/blf+xml", "Call-ID": "w",
+                     "CSeq": "1 NOTIFY", "Via": "v", "From": "f", "To": "t"}))
+        self.assertEqual(self.manager.get("101").state, "ringing")
+
+    def test_terminated_is_reported(self):
+        self.manager.handle_notify(self.notify("terminated", "timeout"))
+        self.assertIn("terminated", self.log)
+
+    def test_terminated_clears_the_frozen_state(self):
+        self.manager.handle_notify(self.notify("terminated", "timeout"))
+        self.assertNotEqual(self.manager.get("101").state, "ringing")
+
+    def test_terminated_opens_a_new_dialog(self):
+        self.manager.handle_notify(self.notify("terminated", "timeout"))
+        self.assertGreaterEqual(len(self.client.dialogs), 3)
+
+    def test_active_state_is_not_logged_as_a_problem(self):
+        self.manager.handle_notify(self.notify("active"))
+        self.assertNotIn("terminated", self.log)

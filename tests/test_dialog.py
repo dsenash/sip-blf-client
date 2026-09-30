@@ -188,3 +188,43 @@ class SerializedWireTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CancelTest(unittest.TestCase):
+    """A CANCEL is only recognisable to the peer if it repeats the INVITE branch."""
+
+    def setUp(self):
+        self.client = make_client()
+        self.dialog = self.client.create_dialog("sip:101@192.168.0.89:5060")
+
+    def branch_of(self, msg):
+        via = msg.headers["Via"]
+        return via.split("branch=")[1].split(";")[0]
+
+    def test_cancel_is_built(self):
+        self.dialog.build_invite()
+        msg = self.dialog.build_cancel()
+        self.assertEqual(msg.method, "CANCEL")
+        self.assertEqual(msg.uri, "sip:101@192.168.0.89:5060")
+
+    def test_cancel_reuses_the_invite_branch(self):
+        invite = self.dialog.build_invite()
+        cancel = self.dialog.build_cancel()
+        self.assertEqual(self.branch_of(cancel), self.branch_of(invite))
+
+    def test_cancel_keeps_the_call_id_and_follows_the_cseq(self):
+        invite = self.dialog.build_invite()
+        cancel = self.dialog.build_cancel()
+        self.assertEqual(cancel.headers["Call-ID"], invite.headers["Call-ID"])
+        self.assertEqual(cancel.headers["CSeq"], "2 CANCEL")
+
+    def test_two_cancels_reuse_the_same_branch(self):
+        self.dialog.build_invite()
+        first = self.branch_of(self.dialog.build_cancel())
+        second = self.branch_of(self.dialog.build_cancel())
+        self.assertEqual(first, second)
+
+    def test_cancel_carries_no_body(self):
+        self.dialog.build_invite()
+        cancel = self.dialog.build_cancel()
+        self.assertEqual(cancel.headers["Content-Length"], "0")
+        self.assertEqual(cancel.body, "")

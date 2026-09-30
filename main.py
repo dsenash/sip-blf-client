@@ -215,6 +215,11 @@ def main():
             if blf is not None:
                 blf.refresh_due()
             session.tick()
+            # Checked here, before receive(): a call can end in tick() without
+            # any further SIP traffic arriving, and the `msg is None` branch
+            # below would otherwise skip this and spin forever.
+            if session.finished and not blf_mode:
+                break
 
             msg = client.receive(timeout=0.5)
             if msg is None:
@@ -226,8 +231,6 @@ def main():
             if blf is not None and blf.handle_response(msg):
                 continue
             session.on_message(msg)
-            if session.finished and not blf_mode:
-                break
     except KeyboardInterrupt:
         print("\n[*] Interrupted")
     finally:

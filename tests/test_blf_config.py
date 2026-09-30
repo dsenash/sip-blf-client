@@ -107,6 +107,30 @@ class ResolveTimingTest(unittest.TestCase):
         self.assertEqual(resolve_timing(
             {"blf": {"expires": "120", "refresh": "60"}}, log=print), (120, 60))
 
+    def test_null_expires_falls_back_with_warning(self):
+        # int(None) raised TypeError straight out of main(), so a single typo
+        # killed the client before it subscribed to anything.
+        expires, refresh = resolve_timing({"blf": {"expires": None}},
+                                          log=RecordingLog())
+        self.assertEqual(expires, 3600)
+        self.assertEqual(refresh, 1800)
+
+    def test_non_numeric_expires_falls_back_with_warning(self):
+        expires, refresh = resolve_timing({"blf": {"expires": "1h"}},
+                                          log=RecordingLog())
+        self.assertEqual(expires, 3600)
+
+    def test_null_refresh_falls_back_with_warning(self):
+        expires, refresh = resolve_timing({"blf": {"expires": 600,
+                                                   "refresh": None}},
+                                          log=RecordingLog())
+        self.assertEqual(refresh, 300)
+
+    def test_warns_about_a_bad_value(self):
+        log = RecordingLog()
+        resolve_timing({"blf": {"expires": "1h"}}, log=log)
+        self.assertIn("expires", log)
+
     def test_refresh_above_expires_is_clamped_with_warning(self):
         log = make_log()
         self.assertEqual(resolve_timing(

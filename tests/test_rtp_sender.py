@@ -92,3 +92,97 @@ class SeqWrapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ClosedSocketTest(unittest.TestCase):
+    """_finish() closes the RTP socket while these threads may still hold it.
+
+    A remote BYE or a hangup during playback is the normal end of every call,
+    so an unhandled OSError here printed a traceback on a routine path.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.wav = os.path.join(self.dir, "t.wav")
+        make_wav(self.wav)
+
+    def tearDown(self):
+        os.remove(self.wav)
+        os.rmdir(self.dir)
+
+    def test_sender_survives_a_socket_closed_mid_stream(self):
+        class ClosingSocket(FakeSocket):
+            def sendto(self, data, addr):
+                if len(self.packets) >= 3:
+                    raise OSError(9, "Bad file descriptor")
+                super().sendto(data, addr)
+
+        sock = ClosingSocket()
+        streamer = WAVStreamer(self.wav, {"sample_rate": 8000})
+        with unittest.mock.patch("builtins.print", QuietLog()):
+            result = streamer.send(sock, ("127.0.0.1", 9), duration=5)
+        self.assertFalse(result)
+        self.assertEqual(len(sock.packets), 3)
+
+    def test_monitor_survives_a_socket_closed_before_it_starts(self):
+        class DeadSocket:
+            def settimeout(self, value):
+                raise OSError(9, "Bad file descriptor")
+
+            def getsockname(self):
+                raise OSError(9, "Bad file descriptor")
+
+        from rtp_sender import RTPMonitor
+        monitor = RTPMonitor(DeadSocket(), {})
+        with unittest.mock.patch("builtins.print", QuietLog()):
+            monitor._monitor()  # must return instead of raising
+
+    def test_monitor_survives_the_socket_closing_while_it_blocks(self):
+        class VanishingSocket:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, value):
+                pass
+
+            def getsockname(self):
+                return ("127.0.0.1", 10000)
+
+            def recvfrom(self, size):
+                self.calls += 1
+                if self.calls > 1:
+                    raise OSError(9, "Bad file descriptor")
+                import socket as s
+                raise s.timeout
+
+        from rtp_sender import RTPMonitor
+        sock = VanishingSocket()
+        monitor = RTPMonitor(sock, {})
+        monitor.stop()
+        with unittest.mock.patch("builtins.print", QuietLog()):
+            monitor._monitor()  # must return instead of raising
+
+
+class HeaderBitLayoutTest(unittest.TestCase):
+    """Byte 0 is V(2) P(1) X(1) CC(4) and must not carry the payload type.
+
+    Packing the payload type into byte 0 set CC=8 for PT=8, so a receiver
+    skipped 32 bytes of CSRC, and set V=3 P=1 for PT=101. The existing
+    round-trip test cannot catch this because parse() ignores byte 0.
+    """
+
+    def test_byte_zero_is_version_two_with_no_csrc(self):
+        packet = RPTPacket.build(0, 0, 1, b"", payload_type=0)
+        self.assertEqual(packet[0], 0x80)
+        self.assertEqual(packet[0] >> 6, 2)      # version
+        self.assertEqual(packet[0] & 0x0F, 0)    # CC
+
+    def test_byte_zero_is_independent_of_payload_type(self):
+        for pt in (0, 8, 101):
+            packet = RPTPacket.build(0, 0, 1, b"", payload_type=pt)
+            self.assertEqual(packet[0], 0x80, f"payload type {pt}")
+
+    def test_byte_one_carries_the_payload_type(self):
+        for pt in (0, 8, 101):
+            packet = RPTPacket.build(0, 0, 1, b"", payload_type=pt)
+            self.assertEqual(packet[1] & 0x7F, pt)
+            self.assertEqual(packet[1] >> 7, 0)   # marker bit clear

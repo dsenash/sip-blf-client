@@ -13,7 +13,11 @@ class RPTPacket:
         # seq is 16-bit and timestamp 32-bit on the wire, so both must wrap.
         # The sender counts past the limit mid-call, and struct.pack raises
         # there rather than truncating, which killed the streaming thread.
-        header = struct.pack("!BBHII", 0x80 | payload_type, payload_type,
+        #
+        # Byte 0 is V(2) P(1) X(1) CC(4): always 0x80 for plain PCMU, and it
+        # must not carry the payload type or CC becomes a CSRC count. Byte 1
+        # is M(1) PT(7).
+        header = struct.pack("!BBHII", 0x80, payload_type & 0x7F,
                              seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc)
         return header + payload
 
@@ -73,7 +77,15 @@ class WAVStreamer:
             payload = self._linear_to_ulaw(chunk)
             packet = RPTPacket.build(self.seq, self.timestamp, self.ssrc, payload, payload_type=0)
 
-            rtp_socket.sendto(packet, dest_addr)
+            try:
+                rtp_socket.sendto(packet, dest_addr)
+            except OSError as e:
+                # The session closes this socket on hangup or a remote BYE,
+                # which is the normal end of a call and can land mid-stream.
+                # The WAV did not play to the end, so this is a failed send
+                # even though some packets went out.
+                print(f"[RTP] Socket closed, stopping stream: {e}")
+                return False
             self.seq += 1
             self.timestamp += payload_size
             sent_packets += 1
@@ -168,11 +180,16 @@ class RTPMonitor:
         return thread
 
     def _monitor(self):
-        self.rtp_socket.settimeout(1)
         try:
             local_port = self.rtp_socket.getsockname()[1]
         except OSError:
             local_port = "?"
+        try:
+            self.rtp_socket.settimeout(1)
+        except OSError:
+            # The session may already have closed the socket between
+            # monitor.start() and this thread getting scheduled.
+            return
         while self.running:
             try:
                 data, addr = self.rtp_socket.recvfrom(65535)

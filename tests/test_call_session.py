@@ -62,9 +62,11 @@ class Request:
 class FakeDialog:
     def __init__(self, target_uri):
         self.target_uri = target_uri
+        self.call_id = f"call-{target_uri}"
         self.invites = []
         self.acks = []
         self.byes = []
+        self.cancels = []
 
     def send_invite(self):
         self.invites.append(True)
@@ -74,6 +76,9 @@ class FakeDialog:
 
     def send_bye(self, to_tag=None):
         self.byes.append(to_tag)
+
+    def send_cancel(self):
+        self.cancels.append(True)
 
 
 class FakeClient:
@@ -116,8 +121,24 @@ def make_session(**overrides):
     return client, session, log
 
 
-def ok_response():
-    return Response(200, "OK", headers={"To": "<sip:101@x>;tag=remoteTAG"})
+def make_response(code, reason, call_id="call-sip:101@10.0.0.1:5060"):
+    return Response(code, reason, headers={"Call-ID": call_id})
+
+
+def ok_response(call_id="call-sip:101@10.0.0.1:5060"):
+    return Response(200, "OK", headers={
+        "To": "<sip:101@x>;tag=remoteTAG", "Call-ID": call_id})
+
+
+def bye_request(client):
+    """A BYE the server would send on the session's own dialog."""
+    return Request("BYE", headers={
+        **BYE_HEADERS, "Call-ID": client.dialogs[0].call_id})
+
+
+def reinvite_request(client):
+    return Request("INVITE", headers={
+        **BYE_HEADERS, "Call-ID": client.dialogs[0].call_id})
 
 
 BYE_HEADERS = {
@@ -186,26 +207,26 @@ class ResponseHandlingTest(unittest.TestCase):
     def test_1xx_is_ignored(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        self.assertFalse(session.on_message(Response(100, "Trying")))
+        self.assertFalse(session.on_message(make_response(100, "Trying")))
         self.assertEqual(session.state, CallSession.CALLING)
 
     def test_4xx_finishes_the_call(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        session.on_message(Response(404, "Not Found"))
+        session.on_message(make_response(404, "Not Found"))
         self.assertEqual(session.state, CallSession.DONE)
         self.assertIn("Call failed: 404", log)
 
     def test_5xx_finishes_the_call(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        session.on_message(Response(503, "Service Unavailable"))
+        session.on_message(make_response(503, "Service Unavailable"))
         self.assertEqual(session.state, CallSession.DONE)
 
     def test_3xx_is_not_followed(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        session.on_message(Response(302, "Moved Temporarily"))
+        session.on_message(make_response(302, "Moved Temporarily"))
         self.assertEqual(session.state, CallSession.DONE)
         self.assertIn("Redirection", log)
 
@@ -217,11 +238,12 @@ class ResponseHandlingTest(unittest.TestCase):
     def test_bye_is_answered_and_finishes(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        session.on_message(Request("BYE", headers=dict(BYE_HEADERS)))
+        session.on_message(bye_request(client))
         self.assertEqual(session.state, CallSession.DONE)
         self.assertEqual(len(client.sent), 1)
         self.assertIn(b"SIP/2.0 200 OK", client.sent[0])
-        self.assertIn(b"Call-ID: server-call-id", client.sent[0])
+        self.assertIn(f"Call-ID: {client.dialogs[0].call_id}".encode(),
+                      client.sent[0])
 
     def test_invite_while_idle_is_ignored(self):
         client, session, log = make_session()
@@ -234,13 +256,13 @@ class ResponseHandlingTest(unittest.TestCase):
         session.start("sip:101@10.0.0.1:5060")
         session.on_message(ok_response())
         self.assertTrue(session.on_message(
-            Request("INVITE", headers=dict(BYE_HEADERS))))
+            reinvite_request(client)))
         self.assertIn(b"SIP/2.0 200 OK", client.sent[0])
 
     def test_finished_stays_finished(self):
         client, session, log = make_session()
         session.start("sip:101@10.0.0.1:5060")
-        session.on_message(Response(404, "Not Found"))
+        session.on_message(make_response(404, "Not Found"))
         self.assertTrue(session.finished)
         self.assertFalse(session.on_message(ok_response()))
 
@@ -304,3 +326,107 @@ class HangupAndTimeoutTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ForeignDialogTest(unittest.TestCase):
+    """A response or request for another Call-ID must not touch this call.
+
+    The same session object is reused for a second call, so a late answer from
+    the first one used to be accepted: the session ACKed with the dead dialog's
+    To tag, adopted its SDP, and then discarded the real answer because the
+    state was no longer CALLING. The call wedged and was never hung up.
+    """
+
+    def test_response_for_another_dialog_is_ignored(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        self.assertFalse(session.on_message(ok_response(call_id="some-other-call")))
+        self.assertEqual(session.state, CallSession.CALLING)
+        self.assertEqual(client.dialogs[0].acks, [])
+
+    def test_rejection_for_another_dialog_is_ignored(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.on_message(Response(404, "Not Found",
+                                    headers={"Call-ID": "some-other-call"}))
+        self.assertEqual(session.state, CallSession.CALLING)
+
+    def test_bye_for_another_dialog_does_not_end_the_call(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.on_message(ok_response())
+        session.on_message(Request("BYE", headers={
+            **BYE_HEADERS, "Call-ID": "some-other-call"}))
+        self.assertEqual(session.state, CallSession.ACTIVE)
+        self.assertEqual(client.sent, [])
+
+    def test_reinvite_for_another_dialog_is_not_answered(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.on_message(ok_response())
+        session.on_message(Request("INVITE", headers={
+            **BYE_HEADERS, "Call-ID": "some-other-call"}))
+        self.assertEqual(client.sent, [])
+
+    def test_bye_for_this_dialog_is_still_answered(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.on_message(ok_response())
+        session.on_message(Request("BYE", headers={
+            **BYE_HEADERS, "Call-ID": client.dialogs[0].call_id}))
+        self.assertEqual(session.state, CallSession.DONE)
+        self.assertEqual(len(client.sent), 1)
+
+    def test_late_answer_after_a_timeout_does_not_reopen_the_session(self):
+        client, session, log = make_session(sip_call_timeout=0)
+        session.start("sip:101@10.0.0.1:5060")
+        session.tick()
+        self.assertEqual(session.state, CallSession.DONE)
+        # A second call reuses the session object with a fresh dialog.
+        self.assertTrue(session.start("sip:102@10.0.0.1:5060"))
+        self.assertFalse(session.on_message(
+            ok_response(call_id=client.dialogs[0].call_id)))
+        self.assertEqual(session.state, CallSession.CALLING)
+        self.assertEqual(client.dialogs[1].acks, [])
+
+
+class CancelTest(unittest.TestCase):
+    """Abandoning a ringing call without a CANCEL leaves the far end ringing."""
+
+    def test_hangup_while_calling_sends_a_cancel(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.hangup()
+        self.assertEqual(client.dialogs[0].cancels, [True])
+        self.assertEqual(session.state, CallSession.DONE)
+
+    def test_cancel_without_an_invite_sends_nothing(self):
+        client, session, log = make_session()
+        session.hangup()
+        self.assertEqual(session.state, CallSession.IDLE)
+        self.assertEqual(client.dialogs, [])
+
+    def test_hangup_while_calling_still_sends_no_bye(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.hangup()
+        self.assertEqual(client.dialogs[0].byes, [])
+
+    def test_timeout_while_calling_sends_a_cancel(self):
+        client, session, log = make_session(sip_call_timeout=0)
+        session.start("sip:101@10.0.0.1:5060")
+        session.tick()
+        self.assertEqual(client.dialogs[0].cancels, [True])
+
+    def test_close_while_calling_sends_a_cancel(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.close()
+        self.assertEqual(client.dialogs[0].cancels, [True])
+
+    def test_an_answered_call_sends_a_bye_not_a_cancel(self):
+        client, session, log = make_session()
+        session.start("sip:101@10.0.0.1:5060")
+        session.on_message(ok_response())
+        session.hangup()
+        self.assertEqual(client.dialogs[0].byes, ["remoteTAG"])
+        self.assertEqual(client.dialogs[0].cancels, [])
