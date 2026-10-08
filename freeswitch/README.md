@@ -54,6 +54,23 @@ Do not copy it on trust. Run:
 and match the snippet to whatever that prints. Keep one form and delete the
 other.
 
+## Digest auth
+
+A FreeSWITCH that challenges SUBSCRIBE answers `407 Proxy Authentication
+Required` (or `401`) with a `Proxy-Authenticate: Digest ...` header. The client
+answers it once per nonce with `Proxy-Authorization`, then re-sends the
+SUBSCRIBE. Credentials live in `config.json`:
+
+    "auth": {
+        "username": "200",
+        "password": "secret"
+    }
+
+Without that section the rejection is logged as before and nothing is retried.
+A nonce that has already been answered is never retried, so wrong credentials
+cost one extra SUBSCRIBE, not a loop. Only SUBSCRIBE is authenticated; the
+INVITE path does not send credentials yet.
+
 ## Trying it without FreeSWITCH
 
 `mock_server.py` answers SUBSCRIBE and replays a small state script, so the
@@ -61,6 +78,15 @@ whole client flow can be exercised locally:
 
     python3 mock_server.py
     python3 main.py --config mock-config.json --blf --no-call
+
+Add `--auth 100:secret123` to the mock and the matching `"auth"` section to
+`mock-config.json` (it is already there) to exercise the challenge path:
+
+    python3 mock_server.py --auth 100:secret123
+    python3 main.py --config mock-config.json --blf --no-call
+
+Keep stdin open while checking it (`(echo blf; sleep 10; echo quit) | ...`):
+a pipe that reaches EOF makes the console quit before the 407 is read.
 
 `mock-config-noblf.json` is the same config with `"enabled": false`, for
 checking that a run without BLF behaves as it did before.

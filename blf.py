@@ -2,6 +2,7 @@ import time
 from xml.etree import ElementTree
 
 from call_session import send_simple_response
+from sip_client import parse_digest_challenge
 
 KNOWN_STATES = ("idle", "ringing", "busy", "held")
 
@@ -187,11 +188,13 @@ class BLFManager:
     a button is not its concern: callers resolve a button with get() and dial it.
     """
 
-    def __init__(self, client, buttons, expires=3600, refresh=1800, log=print):
+    def __init__(self, client, buttons, expires=3600, refresh=1800, log=print,
+                 auth=None):
         self.client = client
         self.expires = expires
         self.refresh = refresh
         self.log = log
+        self.auth = auth
         self.buttons = list(buttons)
         self._dialogs = {}
         self._next_refresh = {}
@@ -356,7 +359,36 @@ class BLFManager:
                     to_tag = msg.headers.get("To", "").split(";tag=")[1].split(";")[0]
                 dialog.to_tag = to_tag
                 self.log(f"[BLF] SUBSCRIBE {name} accepted ({code} {msg.reason})")
+            elif code in (401, 407) and self._answer_challenge(
+                    name, dialog, msg, code):
+                pass
             else:
                 self.log(f"[!] BLF SUBSCRIBE {name} rejected: {code} {msg.reason}")
             return True
         return False
+
+    def _answer_challenge(self, name, dialog, msg, code):
+        """Retry a challenged SUBSCRIBE once, with digest credentials.
+
+        Returns True when the retry went out. A missing credential set, an
+        unusable challenge or a nonce we have already answered all fall
+        through to the caller's rejection log: a challenge must not become a
+        resend loop.
+        """
+        challenge_header = "Proxy-Authenticate" if code == 407 else "WWW-Authenticate"
+        auth_header = "Proxy-Authorization" if code == 407 else "Authorization"
+        if not self.auth:
+            return False
+        challenge = parse_digest_challenge(msg.headers.get(challenge_header, ""))
+        if not challenge.get("nonce"):
+            return False
+        if not dialog.set_auth(auth_header, challenge,
+                               self.auth.get("username", ""),
+                               self.auth.get("password", "")):
+            return False
+        button = self.get(name)
+        dialog.send_subscribe("dialog", "application/blf+xml", self.expires,
+                              f"blf-{name}@{button.domain}")
+        self.log(f"[BLF] SUBSCRIBE {name} authenticating (nonce "
+                 f"{challenge['nonce'][:8]}...)")
+        return True

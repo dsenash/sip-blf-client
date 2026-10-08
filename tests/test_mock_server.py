@@ -1,7 +1,12 @@
 import unittest
+import hashlib
 from xml.etree import ElementTree
 
-from mock_server import BLF_SCRIPT, make_notify, make_notify_body
+from mock_server import BLF_SCRIPT, digest_ok, make_notify, make_notify_body
+
+
+def md5(value):
+    return hashlib.md5(value.encode()).hexdigest()
 
 
 def instances_of(body):
@@ -97,6 +102,63 @@ class MakeNotifyTest(unittest.TestCase):
                           make_notify_body([("101@default", "idle", None)]))
         self.assertIn("From: <sip:100@127.0.0.1>;tag=ftag", raw)
         self.assertIn("To: <sip:100@127.0.0.1>;tag=ttag", raw)
+
+
+class DigestChallengeTest(unittest.TestCase):
+    """The mock must be able to demand digest auth like FreeSWITCH does."""
+
+    USER, PASS, NONCE, REALM = "200", "secret123", "mocknonce1", "default"
+
+    def challenge(self):
+        return (f'Digest realm="{self.REALM}", nonce="{self.NONCE}", '
+                'algorithm=MD5, qop="auth"')
+
+    def header(self, method, uri, username, password, nonce, realm, qop=None,
+               nc="00000001", cnonce="abcd1234"):
+        ha1 = md5(f"{username}:{realm}:{password}")
+        ha2 = md5(f"{method}:{uri}")
+        if qop:
+            resp = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+        else:
+            resp = md5(f"{ha1}:{nonce}:{ha2}")
+        fields = [f'username="{username}"', f'realm="{realm}"',
+                  f'nonce="{nonce}"', f'uri="{uri}"', f'response="{resp}"']
+        if qop:
+            fields += [f"qop={qop}", f"nc={nc}", f'cnonce="{cnonce}"']
+        return "Digest " + ", ".join(fields)
+
+    def test_absent_authorization_is_rejected(self):
+        self.assertFalse(digest_ok("SUBSCRIBE", "sip:201@default", {},
+                                   (self.USER, self.PASS), self.challenge()))
+
+    def test_correct_credentials_are_accepted(self):
+        headers = {"Proxy-Authorization": self.header(
+            "SUBSCRIBE", "sip:201@default", self.USER, self.PASS,
+            self.NONCE, self.REALM, qop="auth")}
+        self.assertTrue(digest_ok("SUBSCRIBE", "sip:201@default", headers,
+                                  (self.USER, self.PASS), self.challenge()))
+
+    def test_wrong_password_is_rejected(self):
+        headers = {"Proxy-Authorization": self.header(
+            "SUBSCRIBE", "sip:201@default", self.USER, "wrong",
+            self.NONCE, self.REALM, qop="auth")}
+        self.assertFalse(digest_ok("SUBSCRIBE", "sip:201@default", headers,
+                                   (self.USER, self.PASS), self.challenge()))
+
+    def test_authorization_without_qop_is_accepted_when_challenge_has_none(self):
+        challenge = f'Digest realm="{self.REALM}", nonce="{self.NONCE}"'
+        headers = {"Authorization": self.header(
+            "SUBSCRIBE", "sip:201@default", self.USER, self.PASS,
+            self.NONCE, self.REALM)}
+        self.assertTrue(digest_ok("SUBSCRIBE", "sip:201@default", headers,
+                                  (self.USER, self.PASS), challenge))
+
+    def test_wrong_nonce_is_rejected(self):
+        headers = {"Proxy-Authorization": self.header(
+            "SUBSCRIBE", "sip:201@default", self.USER, self.PASS,
+            "othernonce", self.REALM, qop="auth")}
+        self.assertFalse(digest_ok("SUBSCRIBE", "sip:201@default", headers,
+                                   (self.USER, self.PASS), self.challenge()))
 
 
 class BlfScriptTest(unittest.TestCase):

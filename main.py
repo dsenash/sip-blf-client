@@ -39,7 +39,12 @@ def build_blf_manager(config, client, log=print):
         log("[!] BLF is enabled but no buttons are configured")
         return None
     expires, refresh = resolve_timing(config, log=log)
-    return BLFManager(client, buttons, expires=expires, refresh=refresh, log=log)
+    auth = config.get("auth")
+    if auth and not (auth.get("username") and auth.get("password")):
+        log("[!] auth section needs both username and password, ignoring it")
+        auth = None
+    return BLFManager(client, buttons, expires=expires, refresh=refresh,
+                      log=log, auth=auth)
 
 
 def render_blf_table(manager):

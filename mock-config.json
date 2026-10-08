@@ -13,6 +13,10 @@
     "user_agent": "PythonSIP/1.0",
     "from_user": "100",
     "display_name": "SIP Client",
+    "auth": {
+        "username": "100",
+        "password": "secret123"
+    },
     "sip_call_timeout": 5,
     "blf": {
         "enabled": true,

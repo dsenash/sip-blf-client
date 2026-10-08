@@ -1,8 +1,19 @@
+import hashlib
+import re
 import socket
 import random
 import threading
 import time
 import uuid
+
+
+# How many distinct digest challenges one dialog will answer before giving
+# up. Enough for a nonce rotation, not enough for a resend loop.
+MAX_AUTH_ATTEMPTS = 3
+
+
+def md5(value):
+    return hashlib.md5(value.encode()).hexdigest()
 
 
 class SIPHeaders(dict):
@@ -93,6 +104,70 @@ class SIPHeaders(dict):
     def items_in_order(self):
         """Every header copy in wire order, repeats included."""
         return list(self._values)
+
+
+def parse_digest_challenge(header):
+    """Parse a Digest challenge into its parameters.
+
+    Returns {} for a missing or non-Digest header, so callers can treat an
+    unusable challenge the same way as no challenge at all.
+    """
+    if not header:
+        return {}
+    value = header.strip()
+    if not value.lower().startswith("digest"):
+        return {}
+    value = value[6:].strip()
+    params = {}
+    for part in re.findall(r'([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*'
+                           r'(?:"((?:[^"\\]|\\.)*)"|([^,\s]+))', value):
+        key = part[0].lower()
+        raw = part[1] if part[1] else part[2]
+        params[key] = raw.replace('\\"', '"')
+    return params
+
+
+def digest_response(method, uri, username, password, challenge, nc=1,
+                    cnonce=None):
+    """Compute the Digest response for one request.
+
+    Without qop the response is md5(HA1:nonce:HA2); with qop=auth the
+    nonce-count, cnonce and qop are folded in (RFC 7616).
+    """
+    realm = challenge.get("realm", "")
+    nonce = challenge.get("nonce", "")
+    ha1 = md5(f"{username}:{realm}:{password}")
+    ha2 = md5(f"{method}:{uri}")
+    qop = challenge.get("qop", "")
+    if qop:
+        if cnonce is None:
+            cnonce = uuid.uuid4().hex[:16]
+        return md5(f"{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop}:{ha2}")
+    return md5(f"{ha1}:{nonce}:{ha2}")
+
+
+def build_digest_header(method, uri, username, password, challenge, nc=1,
+                        cnonce=None):
+    """Build the value of an Authorization/Proxy-Authorization header."""
+    realm = challenge.get("realm", "")
+    nonce = challenge.get("nonce", "")
+    if challenge.get("qop") and cnonce is None:
+        cnonce = uuid.uuid4().hex[:16]
+    response = digest_response(method, uri, username, password, challenge,
+                               nc=nc, cnonce=cnonce)
+    fields = [f'username="{username}"', f'realm="{realm}"',
+              f'nonce="{nonce}"', f'uri="{uri}"', f'response="{response}"']
+    algorithm = challenge.get("algorithm")
+    if algorithm:
+        fields.append(f"algorithm={algorithm}")
+    if challenge.get("qop"):
+        fields.append(f"qop={challenge['qop']}")
+        fields.append(f"nc={nc:08x}")
+        fields.append(f'cnonce="{cnonce}"')
+    opaque = challenge.get("opaque")
+    if opaque:
+        fields.append(f'opaque="{opaque}"')
+    return "Digest " + ", ".join(fields)
 
 
 class SIPMessage:
@@ -199,6 +274,47 @@ class SIPDialog:
         self.event = None
         self.accept = None
         self.event_id = None
+        # Digest credentials for this dialog, learned from a 401/407. Once set
+        # every request built here carries the Authorization header, and the
+        # nonce is remembered so the same challenge cannot loop forever.
+        self.auth = None
+        self.auth_nc = 0
+        self.auth_cnonce = None
+        self.auth_attempts = 0
+
+    def set_auth(self, header, challenge, username, password, cnonce=None):
+        """Record a challenge so future requests answer it.
+
+        Returns False when this exact nonce has already been answered, or
+        when the dialog has answered as many challenges as it should: a
+        server that mints a fresh nonce on every attempt must not be able to
+        keep the client resending forever.
+        """
+        nonce = challenge.get("nonce", "")
+        if self.auth and self.auth["challenge"].get("nonce") == nonce:
+            return False
+        if self.auth_attempts >= MAX_AUTH_ATTEMPTS:
+            return False
+        self.auth = {
+            "header": header,
+            "challenge": challenge,
+            "username": username,
+            "password": password,
+        }
+        self.auth_nc = 1
+        self.auth_cnonce = cnonce
+        self.auth_attempts += 1
+        return True
+
+    def auth_header(self, method, uri):
+        """Build the Authorization header value for one request, or None."""
+        if not self.auth:
+            return None
+        value = build_digest_header(
+            method, uri, self.auth["username"], self.auth["password"],
+            self.auth["challenge"], nc=self.auth_nc, cnonce=self.auth_cnonce)
+        self.auth_nc += 1
+        return value
 
     def _next_cseq(self):
         value = self.cseq
@@ -241,6 +357,12 @@ class SIPDialog:
         msg.add_header("User-Agent", client.user_agent)
         for name, value in extra or []:
             msg.add_header(name, value)
+        # Digest credentials apply to the requests that were challenged: the
+        # subscription and its refreshes. ACK and CANCEL are never challenged
+        # on their own, and the INVITE dialog has no auth of its own yet.
+        if self.auth and method == "SUBSCRIBE":
+            msg.add_header(self.auth["header"],
+                           self.auth_header(method, self.target_uri))
         if body:
             msg.add_header("Content-Type", "application/sdp")
             msg.body = body

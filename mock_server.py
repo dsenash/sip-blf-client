@@ -3,8 +3,46 @@ import struct
 import time
 import threading
 import sys
+import hashlib
 from xml.etree import ElementTree
 from xml.sax.saxutils import quoteattr
+
+
+def md5(value):
+    return hashlib.md5(value.encode()).hexdigest()
+
+
+def digest_ok(method, uri, headers, credentials, challenge):
+    """Check a Digest Authorization/Proxy-Authorization header.
+
+    Returns False for a missing or mismatched header, which is what makes the
+    mock challenge an unauthenticated SUBSCRIBE the way FreeSWITCH does.
+    """
+    if not credentials:
+        return True
+    raw = (headers.get("Proxy-Authorization") or headers.get("Authorization")
+           or "")
+    if not raw.lower().startswith("digest"):
+        return False
+    from sip_client import parse_digest_challenge
+    params = parse_digest_challenge(raw)
+    username, password = credentials
+    if params.get("username") != username:
+        return False
+    expect = parse_digest_challenge(challenge)
+    if params.get("nonce") != expect.get("nonce"):
+        return False
+    uri_value = params.get("uri", uri)
+    ha1 = md5(f"{username}:{expect.get('realm', '')}:{password}")
+    ha2 = md5(f"{method}:{uri_value}")
+    qop = expect.get("qop") or params.get("qop")
+    if qop:
+        nc = params.get("nc", "00000001")
+        cnonce = params.get("cnonce", "")
+        response = md5(f"{ha1}:{expect.get('nonce')}:{nc}:{cnonce}:{qop}:{ha2}")
+    else:
+        response = md5(f"{ha1}:{expect.get('nonce')}:{ha2}")
+    return params.get("response") == response
 
 
 def make_response(recv_msg, status, reason, extra_headers=None, body=""):
@@ -50,6 +88,11 @@ SDP_BODY = (
     "m=audio 12000 RTP/AVP 0 8 101\r\n"
     "a=rtpmap:0 PCMU/8000\r\n"
 )
+
+
+# The fixed challenge the mock hands out when started with --auth.
+DIGEST_CHALLENGE = ('Digest realm="default", nonce="mocknonce1", '
+                    'algorithm=MD5, qop="auth"')
 
 
 # After each SUBSCRIBE, walk this script: (delay_seconds, rpid, caller_number).
@@ -108,10 +151,17 @@ def make_notify(call_id, from_tag, to_tag, cseq, event_id, body):
 
 
 def main():
+    credentials = None
+    if "--auth" in sys.argv:
+        spec = sys.argv[sys.argv.index("--auth") + 1]
+        user, _, password = spec.partition(":")
+        credentials = (user, password)
     port = 5061
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", port))
     print(f"[mock] SIP listening on 127.0.0.1:{port}")
+    if credentials:
+        print(f"[mock] digest auth required for {credentials[0]}")
 
     # RTP rx listener
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -180,6 +230,22 @@ def main():
                     if ": " in line:
                         key, value = line.split(": ", 1)
                         headers[key] = value
+                if credentials and not digest_ok(
+                        "SUBSCRIBE", first.split(" ")[1], headers,
+                        credentials, DIGEST_CHALLENGE):
+                    # The second SUBSCRIBE repeats the call, so an unchanged
+                    # nonce must not turn this into an infinite challenge.
+                    if headers.get("CSeq", "").split(" ")[0] == "2":
+                        sock.sendto(make_response(
+                            lines, 403, "Forbidden").encode(), addr)
+                        print("[mock] SUBSCRIBE with bad credentials, 403")
+                        continue
+                    sock.sendto(make_response(
+                        lines, 407, "Proxy Authentication Required",
+                        extra_headers=[f"Proxy-Authenticate: {DIGEST_CHALLENGE}"]
+                    ).encode(), addr)
+                    print("[mock] SUBSCRIBE challenged, 407")
+                    continue
                 sock.sendto(make_response(lines, 200, "OK").encode(), addr)
                 print("[mock] Got SUBSCRIBE, answered 200 OK")
 
