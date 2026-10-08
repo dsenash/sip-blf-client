@@ -203,6 +203,33 @@ class HandleNotifyTest(unittest.TestCase):
         self.assertEqual([b.name for b in changes], ["101"])
         self.assertEqual(manager.get("101").state, "ringing")
 
+    def test_dialog_info_notify_updates_matching_button(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        raw = ('<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" '
+               'version="0" state="full" entity="sip:101@default">'
+               '<dialog id="1" direction="recipient"><state>early</state>'
+               '<remote><identity>sip:5551234@example.com</identity></remote>'
+               '</dialog></dialog-info>')
+        changes = manager.handle_notify(FakeMessage(
+            "NOTIFY", body=raw,
+            headers={"Content-Type": "application/dialog-info+xml"}))
+        self.assertEqual([b.name for b in changes], ["101"])
+        self.assertEqual(manager.get("101").state, "ringing")
+        self.assertEqual(manager.get("101").caller_number, "5551234")
+
+    def test_empty_dialog_info_sets_the_button_free(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(notify(body(instance("101@default", "busy"))))
+        raw = ('<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" '
+               'version="0" state="full" entity="sip:101@default"></dialog-info>')
+        changes = manager.handle_notify(FakeMessage(
+            "NOTIFY", body=raw,
+            headers={"Content-Type": "application/dialog-info+xml"}))
+        self.assertEqual([b.name for b in changes], ["101"])
+        self.assertEqual(manager.get("101").state, "idle")
+
     def test_matches_by_number_and_domain(self):
         client, manager, log = make_manager()
         manager.subscribe_all()

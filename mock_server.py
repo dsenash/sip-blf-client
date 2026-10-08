@@ -120,15 +120,57 @@ def make_notify_body(instances):
     return "\r\n".join(parts)
 
 
+_BLF_TO_DIALOG_STATE = {
+    "idle": (None, None),
+    "ringing": ("early", "recipient"),
+    "busy": ("confirmed", "initiator"),
+    "held": ("confirmed", "initiator"),
+}
+
+
+def make_dialog_info_body(instances):
+    """Build an RFC 4235 dialog-info NOTIFY body.
+
+    Accepts the same (name, rpid, caller_number) tuples as make_notify_body so
+    the E2E script is shared: an idle button is simply an empty dialog-info.
+    """
+    parts = ['<?xml version="1.0"?>',
+             '<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" '
+             'version="0" state="full" '
+             f'entity={quoteattr("sip:" + instances[0][0])}>']
+    if len(instances) == 1:
+        name, rpid, caller_number = instances[0]
+        dialog_state, direction = _BLF_TO_DIALOG_STATE.get(
+            (rpid or "").strip().lower(), (None, None))
+        if dialog_state:
+            parts.append('  <dialog id="1" '
+                         f'direction={quoteattr(direction)}>')
+            parts.append(f"    <state>{dialog_state}</state>")
+            if caller_number:
+                parts.append('    <remote><identity>'
+                             f'sip:{caller_number}@example.com'
+                             '</identity></remote>')
+            parts.append("  </dialog>")
+    parts.append("</dialog-info>")
+    return "\r\n".join(parts)
+
+
 def _first_resource(body):
     """The NOTIFY Request-URI is the watched resource, taken from the body."""
-    for node in ElementTree.fromstring(body).iter():
+    try:
+        root = ElementTree.fromstring(body)
+    except ElementTree.ParseError:
+        return ""
+    if root.tag.endswith("dialog-info"):
+        return root.get("entity", "").removeprefix("sip:")
+    for node in root.iter():
         if node.tag.endswith("instance") and node.get("name"):
             return node.get("name")
     return ""
 
 
-def make_notify(call_id, from_tag, to_tag, cseq, event_id, body):
+def make_notify(call_id, from_tag, to_tag, cseq, event_id, body,
+                content_type="application/blf+xml"):
     """Build a complete NOTIFY request reusing an existing subscription dialog."""
     lines = [
         f"NOTIFY sip:{_first_resource(body)} SIP/2.0",
@@ -142,7 +184,7 @@ def make_notify(call_id, from_tag, to_tag, cseq, event_id, body):
         "Event: dialog",
         f"Event-ID: {event_id}",
         "Subscription-State: active;expires=3600",
-        "Content-Type: application/blf+xml",
+        f"Content-Type: {content_type}",
         f"Content-Length: {len(body.encode())}",
         "",
         body,
@@ -156,12 +198,18 @@ def main():
         spec = sys.argv[sys.argv.index("--auth") + 1]
         user, _, password = spec.partition(":")
         credentials = (user, password)
+    dialog_info = "--dialog-info" in sys.argv
+    body_maker = make_dialog_info_body if dialog_info else make_notify_body
+    content_type = ("application/dialog-info+xml" if dialog_info
+                    else "application/blf+xml")
     port = 5061
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", port))
     print(f"[mock] SIP listening on 127.0.0.1:{port}")
     if credentials:
         print(f"[mock] digest auth required for {credentials[0]}")
+    if dialog_info:
+        print("[mock] NOTIFY bodies use RFC 4235 dialog-info")
 
     # RTP rx listener
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -264,9 +312,10 @@ def main():
                                resource=resource):
                     for index, (delay, rpid, caller) in enumerate(BLF_SCRIPT):
                         time.sleep(delay)
-                        body = make_notify_body([(resource, rpid, caller)])
+                        body = body_maker([(resource, rpid, caller)])
                         notify = make_notify(call_id, from_tag, to_tag,
-                                             index + 1, event_id, body)
+                                             index + 1, event_id, body,
+                                             content_type)
                         sock.sendto(notify.encode(), addr)
                         print(f"[mock] NOTIFY {resource} rpid={rpid}")
 

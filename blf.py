@@ -16,6 +16,91 @@ def _local_name(tag):
     return tag.rsplit("}", 1)[-1]
 
 
+_DIALOG_STATE_PRIORITY = {"held": 4, "busy": 3, "ringing": 2, "idle": 1}
+
+
+def _state_of(node):
+    """The text of the first <state> child, lower-cased and stripped."""
+    for child in node:
+        if _local_name(child.tag) == "state":
+            return (child.text or "").strip().lower()
+    return None
+
+
+def _dialog_candidate(dialog):
+    """Map one RFC 4235 <dialog> element to (state, caller_number).
+
+    Returns (None, None) when the dialog reports no active call, so the caller
+    can tell an ignored state from a known one.
+    """
+    dialog_state = _state_of(dialog)
+    if dialog_state not in ("early", "confirmed", "terminated"):
+        return None, None
+
+    local_state = None
+    identity = None
+    for node in dialog.iter():
+        name = _local_name(node.tag)
+        if name == "local" and local_state is None:
+            local_state = _state_of(node)
+        elif name == "identity" and identity is None:
+            identity = node.text.strip() if node.text else None
+
+    if dialog_state == "terminated":
+        return "idle", None
+    if dialog_state == "early":
+        return "ringing", _user_part(identity)
+    if local_state == "onhold":
+        return "held", _user_part(identity)
+    return "busy", _user_part(identity)
+
+
+def _user_part(identity):
+    """Pull the number out of 'sip:5551234@example.com'."""
+    if not identity:
+        return None
+    text = identity.strip()
+    if text.lower().startswith("sip:"):
+        text = text[4:]
+    return text.split("@", 1)[0] or None
+
+
+def parse_dialog_info(body):
+    """Parse an RFC 4235 dialog-info NOTIFY body.
+
+    The watched resource is the root's entity attribute, returned as a
+    "number@domain" key like parse_blf_xml uses. An empty dialog-info (no
+    <dialog> elements) means the user is free, so it maps to {resource: idle}.
+    """
+    try:
+        root = ElementTree.fromstring(body)
+    except ElementTree.ParseError as e:
+        raise BLFParseError(str(e)) from e
+
+    entity = root.get("entity") or ""
+    if entity.lower().startswith("sip:"):
+        entity = entity[4:]
+    if not entity:
+        return {}
+
+    params = {"state": "idle"}
+    best_state = "idle"
+    for dialog in root.iter():
+        if _local_name(dialog.tag) != "dialog":
+            continue
+        state, caller = _dialog_candidate(dialog)
+        if state is None:
+            continue
+        if _DIALOG_STATE_PRIORITY.get(state, 0) > \
+                _DIALOG_STATE_PRIORITY.get(best_state, 0):
+            best_state = state
+            params = {"state": state}
+        if caller:
+            params["caller_id_number"] = caller
+    params["state"] = best_state
+    return {entity: params}
+
+
 def parse_blf_xml(body):
     """Parse a BLF NOTIFY body into {instance_name: {param_name: param_value}}.
 
@@ -280,11 +365,13 @@ class BLFManager:
         send_simple_response(self.client, msg, 200, "OK")
         if self._subscription_ended(msg):
             return []
-        if "blf+xml" not in msg.headers.get("Content-Type", ""):
-            return []
-
         try:
-            instances = parse_blf_xml(msg.body)
+            if "dialog-info+xml" in msg.headers.get("Content-Type", ""):
+                instances = parse_dialog_info(msg.body)
+            elif "blf+xml" in msg.headers.get("Content-Type", ""):
+                instances = parse_blf_xml(msg.body)
+            else:
+                return []
         except BLFParseError as e:
             if not self._parse_failed:
                 self._parse_failed = True
@@ -315,7 +402,10 @@ class BLFManager:
         resource = None
         if msg.body:
             try:
-                instances = parse_blf_xml(msg.body)
+                if "dialog-info+xml" in msg.headers.get("Content-Type", ""):
+                    instances = parse_dialog_info(msg.body)
+                else:
+                    instances = parse_blf_xml(msg.body)
             except BLFParseError:
                 instances = {}
             if instances:

@@ -1,8 +1,18 @@
 # FreeSWITCH side of BLF
 
 The client (`blf.py`) is a BLF watcher: it SUBSCRIBEs to each button's extension
-and reads the `rpid` state that FreeSWITCH reports in NOTIFY bodies. It also
-places calls directly with INVITE when a button is pressed. It does not
+and reads the state FreeSWITCH reports in NOTIFY bodies. It understands two
+flavours of NOTIFY and picks one by `Content-Type`:
+
+- `application/blf+xml` — the `rpid` in `instance`/`param` elements used by some
+  FreeSWITCH setups.
+- `application/dialog-info+xml` — the RFC 4235 `dialog-info` that newer
+  FreeSWITCH sends. There, an empty `<dialog-info>` (no `<dialog>` element)
+  means the user is free, `early` means ringing, `confirmed` means busy and
+  `confirmed` with `<local><state>onhold</state></local>` means held. The
+  remote `<identity>` is shown as the caller number.
+
+It also places calls directly with INVITE when a button is pressed. It does not
 register, so no `blf` / `blf_reg_*` directory parameters are needed.
 
 Nothing here is applied automatically. Copy the files by hand.
@@ -85,8 +95,14 @@ Add `--auth 100:secret123` to the mock and the matching `"auth"` section to
     python3 mock_server.py --auth 100:secret123
     python3 main.py --config mock-config.json --blf --no-call
 
+Add `--dialog-info` to the mock to send RFC 4235 `dialog-info` bodies instead
+of the `blf+xml` format:
+
+    python3 mock_server.py --auth 100:secret123 --dialog-info
+
 Keep stdin open while checking it (`(echo blf; sleep 10; echo quit) | ...`):
-a pipe that reaches EOF makes the console quit before the 407 is read.
+a pipe that reaches EOF makes the console quit before the 407 is read. A bare
+Enter in the interactive console is ignored (it is a blank line, not EOF).
 
 `mock-config-noblf.json` is the same config with `"enabled": false`, for
 checking that a run without BLF behaves as it did before.

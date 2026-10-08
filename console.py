@@ -63,9 +63,14 @@ class StdinReader:
 
     def _read_line(self):
         if self.stream is None:
-            # input() prints the prompt itself.
+            # input() prints the prompt itself. A bare Enter returns "" -- a
+            # blank line, not EOF; real EOF raises EOFError.
             return input(self.prompt)
-        return self.stream.readline()
+        line = self.stream.readline()
+        if line == "":
+            # readline() reports the end of the stream as an empty return.
+            raise EOFError
+        return line
 
     def _run(self):
         while not self._stop.is_set():
@@ -77,12 +82,6 @@ class StdinReader:
             except KeyboardInterrupt:
                 continue
             except (ValueError, OSError):
-                return
-
-            if not line:
-                # EOF on the stream: nothing more will ever arrive, so ask the
-                # dispatcher to shut down cleanly instead of hanging.
-                self.queue.put("quit")
                 return
 
             text = line.rstrip("\r\n")

@@ -2,7 +2,8 @@ import unittest
 import hashlib
 from xml.etree import ElementTree
 
-from mock_server import BLF_SCRIPT, digest_ok, make_notify, make_notify_body
+from mock_server import (BLF_SCRIPT, digest_ok, make_dialog_info_body,
+                         make_notify, make_notify_body)
 
 
 def md5(value):
@@ -62,6 +63,36 @@ class MakeNotifyBodyTest(unittest.TestCase):
                                  ("102@default", "ringing", "5551234")])
         names = [i.get("name") for i in instances_of(body)]
         self.assertEqual(names, ["101@default", "102@default"])
+
+
+class MakeDialogInfoBodyTest(unittest.TestCase):
+    def test_idle_is_an_empty_dialog_info(self):
+        body = make_dialog_info_body([("101@default", "idle", None)])
+        root = ElementTree.fromstring(body)
+        self.assertTrue(root.tag.endswith("dialog-info"))
+        self.assertEqual(root.get("entity"), "sip:101@default")
+        self.assertFalse([n for n in root.iter() if n.tag.endswith("dialog")])
+
+    def test_ringing_maps_to_an_early_dialog(self):
+        body = make_dialog_info_body([("101@default", "ringing", "5551234")])
+        root = ElementTree.fromstring(body)
+        state = [n.text for n in root.iter() if n.tag.endswith("state")]
+        self.assertEqual(state, ["early"])
+        identity = [n.text for n in root.iter() if n.tag.endswith("identity")]
+        self.assertEqual(identity, ["sip:5551234@example.com"])
+
+    def test_busy_maps_to_a_confirmed_dialog(self):
+        body = make_dialog_info_body([("101@default", "busy", None)])
+        root = ElementTree.fromstring(body)
+        state = [n.text for n in root.iter() if n.tag.endswith("state")]
+        self.assertEqual(state, ["confirmed"])
+
+    def test_request_uri_comes_from_dialog_info_entity(self):
+        body = make_dialog_info_body([("101@default", "ringing", None)])
+        raw = make_notify("c", "ftag", "ttag", 1, "e", body,
+                          "application/dialog-info+xml")
+        self.assertTrue(raw.startswith("NOTIFY sip:101@default SIP/2.0"))
+        self.assertIn("Content-Type: application/dialog-info+xml", raw)
 
 
 class MakeNotifyTest(unittest.TestCase):

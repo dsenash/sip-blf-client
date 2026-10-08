@@ -3,13 +3,34 @@ import unittest
 from xml.etree import ElementTree
 
 from blf import (BLFButton, BLFParseError, extract_state, format_change,
-                  parse_blf_xml)
+                  parse_blf_xml, parse_dialog_info)
 
 NS = 'xmlns="urn:freedeswitch:blf"'
+DIALOG_INFO_NS = 'xmlns="urn:ietf:params:xml:ns:dialog-info"'
 
 
 def body(inner):
     return f'<?xml version="1.0" encoding="UTF-8"?>\n<event name="dialog" {NS}>{inner}</event>'
+
+
+def dialog_info(inner="", state="full", entity="sip:205@192.168.8.134"):
+    return (f'<?xml version="1.0"?>'
+            f'<dialog-info {DIALOG_INFO_NS} version="0" state="{state}" '
+            f'entity="{entity}">{inner}</dialog-info>')
+
+
+def dialog(dialog_state, direction="recipient", remote="sip:5551234@example.com",
+           local_state=None):
+    parts = [f'<dialog id="123" direction="{direction}">',
+             f'<state>{dialog_state}</state>']
+    local = ''
+    if local_state:
+        local = f'<local><identity>sip:205@example.com</identity>' \
+                f'<state>{local_state}</state></local>'
+    parts.append(local)
+    parts.append(f'<remote><identity>{remote}</identity></remote>')
+    parts.append('</dialog>')
+    return "".join(parts)
 
 
 def instance(name, rpid, caller_number=None, caller_name=None, uuid=None):
@@ -67,6 +88,65 @@ class ParseBlfXmlTest(unittest.TestCase):
     def test_empty_body_raises(self):
         with self.assertRaises(BLFParseError):
             parse_blf_xml("")
+
+
+class ParseDialogInfoTest(unittest.TestCase):
+    def test_empty_dialog_info_means_idle(self):
+        parsed = parse_dialog_info(dialog_info())
+        self.assertEqual(parsed, {"205@192.168.8.134": {"state": "idle"}})
+
+    def test_early_dialog_means_ringing(self):
+        parsed = parse_dialog_info(dialog_info(dialog("early")))
+        self.assertEqual(parsed["205@192.168.8.134"]["state"], "ringing")
+
+    def test_early_recipient_is_ringing(self):
+        parsed = parse_dialog_info(dialog_info(
+            dialog("early", direction="recipient")))
+        self.assertEqual(parsed["205@192.168.8.134"]["state"], "ringing")
+
+    def test_terminated_dialog_means_idle(self):
+        parsed = parse_dialog_info(dialog_info(
+            dialog("terminated", direction="terminated")))
+        self.assertEqual(parsed["205@192.168.8.134"]["state"], "idle")
+
+    def test_confirmed_dialog_means_busy(self):
+        parsed = parse_dialog_info(dialog_info(
+            dialog("confirmed", direction="initiator")))
+        self.assertEqual(parsed["205@192.168.8.134"]["state"], "busy")
+
+    def test_confirmed_onhold_dialog_means_held(self):
+        parsed = parse_dialog_info(dialog_info(
+            dialog("confirmed", direction="initiator", local_state="onhold")))
+        self.assertEqual(parsed["205@192.168.8.134"]["state"], "held")
+
+    def test_records_the_remote_caller_number(self):
+        parsed = parse_dialog_info(dialog_info(
+            dialog("confirmed", remote="sip:5551234@example.com")))
+        self.assertEqual(parsed["205@192.168.8.134"]["caller_id_number"],
+                         "5551234")
+
+    def test_entity_without_the_sip_scheme_still_matches(self):
+        raw = f'<dialog-info {DIALOG_INFO_NS} version="0" state="full" ' \
+              f'entity="205@192.168.8.134">{dialog("early")}</dialog-info>'
+        self.assertIn("205@192.168.8.134", parse_dialog_info(raw))
+
+    def test_missing_entity_parses_to_nothing(self):
+        raw = f'<dialog-info {DIALOG_INFO_NS} version="0" state="full"></dialog-info>'
+        self.assertEqual(parse_dialog_info(raw), {})
+
+    def test_malformed_xml_raises(self):
+        with self.assertRaises(BLFParseError):
+            parse_dialog_info("<dialog-info><dialog></dialog-info>")
+
+    def test_empty_body_raises(self):
+        with self.assertRaises(BLFParseError):
+            parse_dialog_info("")
+
+    def test_two_active_dialogs_prefer_the_busy_one(self):
+        raw = dialog_info(dialog("early") + dialog("confirmed",
+                                                   direction="initiator"))
+        self.assertEqual(parse_dialog_info(raw)["205@192.168.8.134"]["state"],
+                         "busy")
 
 
 class ExtractStateTest(unittest.TestCase):

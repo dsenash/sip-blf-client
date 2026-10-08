@@ -2,6 +2,7 @@ import io
 import queue
 import threading
 import unittest
+from unittest import mock
 
 from console import HELP_TEXT, KNOWN_COMMANDS, StdinReader, parse_command
 
@@ -116,6 +117,37 @@ class StdinReaderTest(unittest.TestCase):
         reader = StdinReader(q, stream=io.StringIO(""))
         reader.start()
         reader.join(timeout=5)
+        self.assertEqual(q.get_nowait(), "quit")
+
+    def test_input_mode_bare_enter_is_not_eof(self):
+        # Interactive input() turns a bare Enter into "" -- a blank line, not
+        # EOF. The reader must keep going and deliver the lines after it.
+        lines = ["", "blf list", "quit"]
+
+        def fake_input(prompt):
+            if not lines:
+                raise EOFError
+            return lines.pop(0)
+
+        q = queue.Queue()
+        with mock.patch("builtins.input", side_effect=fake_input):
+            reader = StdinReader(q)
+            reader.start()
+            reader.join(timeout=5)
+        delivered = []
+        while not q.empty():
+            delivered.append(q.get_nowait())
+        # The blank Enter must not end the reader: every typed command arrives.
+        self.assertIn("blf list", delivered)
+        self.assertIn("quit", delivered)
+
+    def test_input_mode_real_eof_asks_for_shutdown(self):
+        # An actual Ctrl-D / closed stdin still shuts down cleanly.
+        q = queue.Queue()
+        with mock.patch("builtins.input", side_effect=EOFError):
+            reader = StdinReader(q)
+            reader.start()
+            reader.join(timeout=5)
         self.assertEqual(q.get_nowait(), "quit")
 
     def test_stop_ends_a_blocked_thread(self):
