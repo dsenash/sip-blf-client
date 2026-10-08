@@ -248,7 +248,11 @@ def main():
 
     if args.no_call and not blf_mode:
         print("[!] --no-call without BLF, placing the call anyway")
-    if not args.no_call or not blf_mode:
+        session.start(uri)
+    elif args.no_call:
+        # Only watch BLF, do not place a call.
+        pass
+    else:
         session.start(uri)
 
     commands = queue.Queue()
