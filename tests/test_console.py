@@ -4,7 +4,8 @@ import threading
 import unittest
 from unittest import mock
 
-from console import HELP_TEXT, KNOWN_COMMANDS, StdinReader, parse_command
+from console import (HELP_TEXT, KNOWN_COMMANDS, StdinReader, enable_line_editing,
+                     parse_command)
 
 
 class BlockingStream:
@@ -48,9 +49,27 @@ class ParseCommandTest(unittest.TestCase):
     def test_none_is_none(self):
         self.assertIsNone(parse_command(None))
 
+    def test_question_mark_parses_as_a_command(self):
+        self.assertEqual(parse_command("?"), ("?", []))
+
     def test_every_known_command_round_trips(self):
         for name in KNOWN_COMMANDS:
             self.assertEqual(parse_command(name), (name, []))
+
+
+class LineEditingTest(unittest.TestCase):
+    def test_enables_line_editing_when_readline_exists(self):
+        enable = enable_line_editing()
+        self.assertIsInstance(enable, bool)
+
+    def test_gracefully_disables_when_readline_is_missing(self):
+        with mock.patch("importlib.import_module",
+                        side_effect=ImportError("no readline")):
+            self.assertFalse(enable_line_editing())
+
+    def test_reports_enabled_when_readline_successfully_imports(self):
+        with mock.patch("importlib.import_module", return_value=mock.Mock()):
+            self.assertTrue(enable_line_editing())
 
 
 class HelpTextTest(unittest.TestCase):

@@ -89,7 +89,7 @@ def dispatch_command(parsed, ctx):
     if name == "quit":
         return False
 
-    if name == "help":
+    if name in ("help", "?"):
         ctx.log(HELP_TEXT)
         return True
 

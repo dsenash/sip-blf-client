@@ -218,6 +218,11 @@ class DispatchTest(unittest.TestCase):
         dispatch_command(parse_command("help"), ctx)
         self.assertIn("press <name>", log)
 
+    def test_question_mark_prints_help_text(self):
+        ctx, log = make_context()
+        dispatch_command(parse_command("?"), ctx)
+        self.assertIn("press <name>", log)
+
     def test_hangup_calls_the_session(self):
         ctx, log = make_context()
         dispatch_command(parse_command("hangup"), ctx)

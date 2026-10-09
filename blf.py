@@ -284,6 +284,8 @@ class BLFManager:
         self._dialogs = {}
         self._next_refresh = {}
         self._parse_failed = False
+        self._warned_content_type = False
+        self._warned_resource = False
         # NOTIFY bodies are keyed by the watched resource, which is what a real
         # BLF watcher keys on. Fall back to the button name for entries whose
         # name and number differ.
@@ -299,11 +301,21 @@ class BLFManager:
         return list(self.buttons)
 
     def _find_by_resource(self, resource):
+        # A notifier echoes the watched AOR with the domain it knows about,
+        # which does not have to be the domain the config subscribed with
+        # (FreeSWITCH uses its own host here). The full "number@domain" key
+        # stays the fast path; the number alone is the fallback so a button is
+        # still reached across a domain difference.
         button = self._by_resource.get(resource)
         if button is not None:
             return button
+        number = resource.split("@", 1)[0] if "@" in resource else resource
+        if number:
+            for candidate in self.buttons:
+                if candidate.number == number:
+                    return candidate
         for candidate in self.buttons:
-            if candidate.name == resource:
+            if candidate.name == resource or candidate.name == number:
                 return candidate
         return None
 
@@ -365,12 +377,17 @@ class BLFManager:
         send_simple_response(self.client, msg, 200, "OK")
         if self._subscription_ended(msg):
             return []
+        content_type = msg.headers.get("Content-Type", "").lower()
         try:
-            if "dialog-info+xml" in msg.headers.get("Content-Type", ""):
+            if "dialog-info+xml" in content_type:
                 instances = parse_dialog_info(msg.body)
-            elif "blf+xml" in msg.headers.get("Content-Type", ""):
+            elif "blf+xml" in content_type:
                 instances = parse_blf_xml(msg.body)
             else:
+                if not self._warned_content_type:
+                    self._warned_content_type = True
+                    self.log(f"[!] BLF NOTIFY ignored: unsupported "
+                             f"Content-Type '{content_type}'")
                 return []
         except BLFParseError as e:
             if not self._parse_failed:
@@ -384,6 +401,9 @@ class BLFManager:
             button = self._find_by_resource(resource)
             if button is not None and button.apply(params):
                 changed.append(button)
+            elif button is None and not self._warned_resource:
+                self._warned_resource = True
+                self.log(f"[!] BLF NOTIFY for '{resource}' matches no button")
 
         for button in changed:
             self.log(format_change(button))

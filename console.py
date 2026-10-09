@@ -1,5 +1,6 @@
 """Terminal command parsing and the background reader for stdin."""
 
+import importlib
 import sys
 import threading
 
@@ -10,8 +11,24 @@ HELP_TEXT = """Commands:
   blf list        Show the current state of every BLF button
   blf refresh     Re-subscribe to all BLF buttons now
   help            Show this help
+  ?               Same as 'help'
   hangup          Hang up the active call
   quit            Hang up, unsubscribe and exit"""
+
+
+def enable_line_editing():
+    """Give the interactive prompt an up-arrow history and line editing.
+
+    Python's input() does not do either on its own: both come from the
+    readline module, which has to be loaded before the first prompt. Returns
+    whether it is available; a build without it still works, just without the
+    niceties.
+    """
+    try:
+        importlib.import_module("readline")
+        return True
+    except ImportError:
+        return False
 
 
 def parse_command(line):
@@ -42,6 +59,8 @@ class StdinReader:
         self._thread = None
 
     def start(self):
+        if self.stream is None:
+            enable_line_editing()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self._thread

@@ -61,5 +61,6 @@ blf> Commands:
   blf list        Show the current state of every BLF button
   blf refresh     Re-subscribe to all BLF buttons now
   help            Show this help
+  ?               Same as 'help'
   hangup          Hang up the active call
   quit            Hang up, unsubscribe and exit

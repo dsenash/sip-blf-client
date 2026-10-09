@@ -236,6 +236,38 @@ class HandleNotifyTest(unittest.TestCase):
         manager.handle_notify(notify(body(instance("102@default", "busy"))))
         self.assertEqual(manager.get("102").state, "busy")
 
+    def test_dialog_info_matches_by_number_when_entity_domain_differs(self):
+        # A real notifier echoes the watched AOR with the host it knows about
+        # (its own domain or the user's registrable address), which need not be
+        # the domain the config subscribed with. Matching by the number alone
+        # keeps the button reachable across that difference.
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        raw = ('<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" '
+               'version="0" state="full" entity="sip:101@192.168.8.134">'
+               '<dialog id="1" direction="recipient"><state>confirmed</state>'
+               '<remote><identity>sip:5551234@example.com</identity></remote>'
+               '</dialog></dialog-info>')
+        changes = manager.handle_notify(FakeMessage(
+            "NOTIFY", body=raw,
+            headers={"Content-Type": "application/dialog-info+xml"}))
+        self.assertEqual([b.name for b in changes], ["101"])
+        self.assertEqual(manager.get("101").state, "busy")
+        self.assertEqual(manager.get("101").caller_number, "5551234")
+
+    def test_empty_dialog_info_matches_by_number_when_domain_differs(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        manager.handle_notify(notify(body(instance("101@default", "busy"))))
+        raw = ('<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" '
+               'version="0" state="full" entity="sip:101@default.example">'
+               '</dialog-info>')
+        changes = manager.handle_notify(FakeMessage(
+            "NOTIFY", body=raw,
+            headers={"Content-Type": "application/dialog-info+xml"}))
+        self.assertEqual([b.name for b in changes], ["101"])
+        self.assertEqual(manager.get("101").state, "idle")
+
     def test_matches_a_button_whose_number_differs(self):
         button = BLFButton("operator", "101", "default")
         client = FakeClient()
@@ -295,6 +327,30 @@ class HandleNotifyTest(unittest.TestCase):
         msg = FakeMessage("NOTIFY", body=body(instance("101@default", "ringing")),
                           headers={"Content-Type": "application/simple-message-summary"})
         self.assertEqual(manager.handle_notify(msg), [])
+
+    def test_unrecognized_content_type_is_logged(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        msg = FakeMessage("NOTIFY", body=body(instance("101@default", "ringing")),
+                          headers={"Content-Type": "text/plain"})
+        manager.handle_notify(msg)
+        self.assertIn("text/plain", log)
+
+    def test_resource_with_no_button_is_logged(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        raw = body(instance("777@example.com", "ringing"))
+        manager.handle_notify(notify(raw))
+        self.assertIn("777@example.com", log)
+
+    def test_unmatched_resource_is_not_logged_twice(self):
+        client, manager, log = make_manager()
+        manager.subscribe_all()
+        raw = body(instance("777@example.com", "ringing"))
+        manager.handle_notify(notify(raw))
+        manager.handle_notify(notify(raw))
+        hits = [line for line in log.lines if "@example.com" in line]
+        self.assertEqual(len(hits), 1)
 
     def test_malformed_body_is_ignored(self):
         client, manager, log = make_manager()
